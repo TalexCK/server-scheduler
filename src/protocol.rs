@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::config::{SoloMode, SoloStartup};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaunchRequest {
   #[serde(default)]
@@ -113,4 +115,40 @@ pub struct PendingTransfer {
   pub server_id: String,
   pub player: String,
   pub address: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SoloSessionCreateRequest {
+  pub game_id: String,
+  pub owner: Uuid,
+  #[serde(default)]
+  pub players: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SoloLaunchForm {
+  pub owner: Uuid,
+  #[serde(default)]
+  pub players: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SoloDestroyForm {
+  pub player: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SoloSessionInfo {
+  pub session_id: String,
+  pub game_id: String,
+  pub server_id: String,
+  pub backend_id: String,
+  pub owner: Uuid,
+  pub players: Vec<Uuid>,
+  pub mode: SoloMode,
+  pub startup: SoloStartup,
+  pub created: u64,
+  pub updated: u64,
+  pub expires: Option<u64>,
+  pub instance: Option<InstanceInfo>,
 }

@@ -299,6 +299,8 @@ pub struct ServerDefinition {
   #[serde(default = "default_restart_delay")]
   pub restart_delay_seconds: u64,
   #[serde(default)]
+  pub daily_restart: Option<DailyRestartDefinition>,
+  #[serde(default)]
   pub idle_timeout_seconds: Option<u64>,
   #[serde(default)]
   pub gamevoting: Option<GameVotingDefinition>,
@@ -349,8 +351,37 @@ impl ServerDefinition {
         "idle_timeout_seconds must be greater than zero or null".into(),
       ));
     }
+    if let Some(daily_restart) = &self.daily_restart {
+      daily_restart.validate()?;
+    }
     if let Some(game) = &self.gamevoting {
       game.validate()?;
+      if game.solo_mode == SoloMode::PlayerWorld {
+        if !game.solo {
+          return Err(ConfigError::Validation(
+            "player_world solo_mode requires solo to be enabled".into(),
+          ));
+        }
+        if game.solo_startup != SoloStartup::OnDemand {
+          return Err(ConfigError::Validation(
+            "player_world solo_mode requires on_demand startup".into(),
+          ));
+        }
+        if self.autostart {
+          return Err(ConfigError::Validation(
+            "player_world solo_mode cannot use server autostart".into(),
+          ));
+        }
+        if self
+          .properties
+          .get("level-name")
+          .is_some_and(|value| value != "world")
+        {
+          return Err(ConfigError::Validation(
+            "player_world solo_mode requires level-name to be world".into(),
+          ));
+        }
+      }
     }
     for artifact in &self.plugins {
       validate_id(&artifact.id)?;
@@ -402,6 +433,31 @@ impl ServerDefinition {
   }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DailyRestartDefinition {
+  pub hour: u8,
+  #[serde(default)]
+  pub minute: u8,
+  #[serde(default = "default_daily_restart_empty_grace")]
+  pub empty_grace_seconds: u64,
+}
+
+impl DailyRestartDefinition {
+  fn validate(&self) -> Result<(), ConfigError> {
+    if self.hour > 23 || self.minute > 59 {
+      return Err(ConfigError::Validation(
+        "daily_restart time is invalid".into(),
+      ));
+    }
+    if self.empty_grace_seconds == 0 {
+      return Err(ConfigError::Validation(
+        "daily_restart empty_grace_seconds must be greater than zero".into(),
+      ));
+    }
+    Ok(())
+  }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameVotingDefinition {
   #[serde(default)]
@@ -423,6 +479,16 @@ pub struct GameVotingDefinition {
   pub min_players: u32,
   #[serde(default = "default_game_max_players")]
   pub max_players: u32,
+  #[serde(default)]
+  pub solo: bool,
+  #[serde(default)]
+  pub solo_mode: SoloMode,
+  #[serde(default)]
+  pub solo_startup: SoloStartup,
+  #[serde(default = "default_solo_max_players")]
+  pub solo_max_players: u32,
+  #[serde(default = "default_solo_retention_days")]
+  pub solo_retention_days: u32,
 }
 
 impl GameVotingDefinition {
@@ -460,17 +526,70 @@ impl GameVotingDefinition {
         "GameVoting player limits are invalid".into(),
       ));
     }
+    if self.solo_max_players == 0 || self.solo_retention_days == 0 {
+      return Err(ConfigError::Validation(
+        "GameVoting solo limits must be greater than zero".into(),
+      ));
+    }
+    if self.solo
+      && (self.solo_max_players < self.min_players || self.solo_max_players > self.max_players)
+    {
+      return Err(ConfigError::Validation(
+        "GameVoting solo_max_players is outside the game player range".into(),
+      ));
+    }
+    if self.solo_mode == SoloMode::PlayerWorld && self.solo_max_players > 2 {
+      return Err(ConfigError::Validation(
+        "player_world solo_max_players must be 1 or 2".into(),
+      ));
+    }
     let java_int_max = i32::MAX as u32;
     if self.order > java_int_max
       || self.custom_model_data > java_int_max
       || self.min_players > java_int_max
       || self.max_players > java_int_max
+      || self.solo_max_players > java_int_max
+      || self.solo_retention_days > java_int_max
     {
       return Err(ConfigError::Validation(
         "GameVoting numeric values exceed the Java integer range".into(),
       ));
     }
     Ok(())
+  }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SoloMode {
+  #[default]
+  Shared,
+  PlayerWorld,
+}
+
+impl SoloMode {
+  pub fn as_str(self) -> &'static str {
+    match self {
+      Self::Shared => "shared",
+      Self::PlayerWorld => "player_world",
+    }
+  }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SoloStartup {
+  Always,
+  #[default]
+  OnDemand,
+}
+
+impl SoloStartup {
+  pub fn as_str(self) -> &'static str {
+    match self {
+      Self::Always => "always",
+      Self::OnDemand => "on_demand",
+    }
   }
 }
 
@@ -658,6 +777,9 @@ fn default_startup_timeout() -> u64 {
 fn default_restart_delay() -> u64 {
   10
 }
+fn default_daily_restart_empty_grace() -> u64 {
+  300
+}
 fn default_files_path() -> PathBuf {
   PathBuf::from("files")
 }
@@ -678,6 +800,12 @@ fn default_game_min_players() -> u32 {
 }
 fn default_game_max_players() -> u32 {
   50
+}
+fn default_solo_max_players() -> u32 {
+  1
+}
+fn default_solo_retention_days() -> u32 {
+  10
 }
 
 #[cfg(test)]
@@ -735,6 +863,44 @@ mod tests {
   }
 
   #[test]
+  fn server_definition_parses_daily_restart() {
+    let definition: ServerDefinition = serde_json::from_value(serde_json::json!({
+      "core": {"kind":"fabric","minecraft_version":"26.2","java":"25"},
+      "memory": {"initial_mib":1024,"maximum_mib":4096},
+      "daily_restart": {
+        "hour": 4
+      }
+    }))
+    .unwrap();
+    assert!(definition.validate().is_ok());
+    assert_eq!(
+      definition.daily_restart,
+      Some(DailyRestartDefinition {
+        hour: 4,
+        minute: 0,
+        empty_grace_seconds: 300
+      })
+    );
+  }
+
+  #[test]
+  fn server_definition_rejects_invalid_daily_restart() {
+    for daily_restart in [
+      serde_json::json!({"hour": 24}),
+      serde_json::json!({"hour": 4, "minute": 60}),
+      serde_json::json!({"hour": 4, "empty_grace_seconds": 0}),
+    ] {
+      let definition: ServerDefinition = serde_json::from_value(serde_json::json!({
+        "core": {"kind":"fabric","minecraft_version":"26.2","java":"25"},
+        "memory": {"initial_mib":1024,"maximum_mib":4096},
+        "daily_restart": daily_restart
+      }))
+      .unwrap();
+      assert!(definition.validate().is_err());
+    }
+  }
+
+  #[test]
   fn server_definition_parses_gamevoting_catalog_entry() {
     let definition: ServerDefinition = serde_json::from_value(serde_json::json!({
       "core": {"kind":"fabric","minecraft_version":"1.21.11","java":"21"},
@@ -753,7 +919,61 @@ mod tests {
     }))
     .unwrap();
     assert!(definition.validate().is_ok());
-    assert_eq!(definition.gamevoting.unwrap().max_players, 8);
+    let game = definition.gamevoting.unwrap();
+    assert_eq!(game.max_players, 8);
+    assert!(!game.solo);
+    assert_eq!(game.solo_mode, SoloMode::Shared);
+    assert_eq!(game.solo_startup, SoloStartup::OnDemand);
+    assert_eq!(game.solo_max_players, 1);
+    assert_eq!(game.solo_retention_days, 10);
+  }
+
+  #[test]
+  fn server_definition_validates_player_world_solo_mode() {
+    let valid: ServerDefinition = serde_json::from_value(serde_json::json!({
+      "core": {"kind":"fabric","minecraft_version":"26.2","java":"25"},
+      "memory": {"initial_mib":1024,"maximum_mib":4096},
+      "gamevoting": {
+        "id": "puzzle",
+        "name": "Puzzle",
+        "material": "COMPASS",
+        "min_players": 1,
+        "max_players": 2,
+        "solo": true,
+        "solo_mode": "player_world",
+        "solo_startup": "on_demand",
+        "solo_max_players": 2
+      }
+    }))
+    .unwrap();
+    assert!(valid.validate().is_ok());
+
+    for invalid in [
+      serde_json::json!({"solo_startup": "always"}),
+      serde_json::json!({"solo_max_players": 3}),
+      serde_json::json!({"solo": false}),
+    ] {
+      let mut definition_value = serde_json::to_value(&valid).unwrap();
+      for (key, override_value) in invalid.as_object().unwrap() {
+        value_pointer_mut(&mut definition_value, "/gamevoting")
+          .insert(key.clone(), override_value.clone());
+      }
+      let definition: ServerDefinition = serde_json::from_value(definition_value).unwrap();
+      assert!(definition.validate().is_err());
+    }
+
+    let mut invalid_level = valid;
+    invalid_level
+      .properties
+      .insert("level-name".into(), "other".into());
+    assert!(invalid_level.validate().is_err());
+  }
+
+  fn value_pointer_mut<'a>(
+    value: &'a mut serde_json::Value,
+    pointer: &str,
+  ) -> &'a mut serde_json::Map<String, serde_json::Value> {
+    value.pointer_mut(pointer).unwrap().as_object_mut().unwrap()
   }
 
   #[test]

@@ -79,8 +79,10 @@ cargo build --release --locked
 参数以及 Java 21、Java 25 的 Home 均由此文件统一配置。
 
 Velocity 使用 `ports.velocity` 的固定入口端口。普通子服务器从 `ports.start` 开始
-选择第一个未被当前 Scheduler 实例或宿主机其他进程占用的端口，并在进程退出后释放；默认范围是
-`50001-65535`。Velocity 端口必须位于子服务器端口范围之外。
+选择第一个未被当前 Scheduler 实例、宿主机其他进程或端口复用冷却占用的端口。子服
+进程退出后立即释放占用，但该端口会进入 30 秒进程内冷却，期间新实例直接选择下一个
+可用端口，不等待冷却结束。默认范围是 `50001-65535`。Velocity 端口必须位于子服务器
+端口范围之外，且不进入复用冷却；Scheduler 整体重启不会持久化冷却状态。
 
 `enable-frpc` 默认为 `false`。设为 `true` 后，Scheduler 会从
 `paths.network/frpc-core` 启动 FRPC，并固定传入 `-c ./frpc.toml`。默认组合等价于在
@@ -156,6 +158,11 @@ API 使用的服务器 ID。
   },
   "autostart": false,
   "restart_delay_seconds": 5,
+  "daily_restart": {
+    "hour": 4,
+    "minute": 0,
+    "empty_grace_seconds": 300
+  },
   "idle_timeout_seconds": 300,
   "gamevoting": {
     "order": 10,
@@ -169,7 +176,12 @@ API 使用的服务器 ID。
     "min_version": "1.21.11",
     "max_version": "26.2",
     "min_players": 2,
-    "max_players": 16
+    "max_players": 16,
+    "solo": false,
+    "solo_mode": "shared",
+    "solo_startup": "on_demand",
+    "solo_max_players": 2,
+    "solo_retention_days": 10
   },
   "plugins": [
     {
@@ -265,6 +277,34 @@ SCHEDULER_SERVER_PORT
 启用 `autostart` 的服务器由后台监控自动启动。非自动启动服务器设置
 `idle_timeout_seconds` 后，会在无人连接达到指定秒数时停止。
 
+`daily_restart` 使用宿主机本地时区。到达 `hour` 和 `minute` 指定的每日时间时，
+若服务器无人在线则立即重启；若仍有玩家，则等待全员退出并连续空服
+`empty_grace_seconds` 后重启。空服等待期间有玩家重新进入会重新计时。当天计划时间后
+新启动或已手动重启的实例不会重复执行当天的计划重启。需要长期运行的服务器同时设置
+`autostart: true`。
+
+`gamevoting.solo` 默认为 `false`。启用后，`solo_mode` 支持 `shared` 和
+`player_world`，`solo_startup` 支持 `always` 和 `on_demand`，默认分别为 `shared`
+和 `on_demand`。`solo_max_players` 限制单次启动请求人数；请求还必须同时满足游戏的
+`min_players` 与 `max_players`。`player_world` 仅允许 1 或 2 人，并强制使用
+`on_demand`、关闭服务器级 `autostart`，且 `level-name` 必须为 `world`。
+
+`shared` 使用服务器定义对应的开放静态后端，不冻结玩家名单。`always` 会让 Scheduler
+保持后端运行，`on_demand` 在首个请求时启动。任意在线玩家都可通过 Solo 请求启动或加入
+同一实例，每次请求中的玩家列表只用于该次传送。组合启动接口会原子串行化启动与传送，
+并发请求不会相互覆盖。
+
+`player_world` 为每份名单创建独立动态实例、端口和 Velocity 服务器 ID。地图母版必须放在
+`worlds/<game-id>/world`，持久副本位于
+`worlds/<game-id>/<owner-uuid>/world`，旁边的 `config.json` 保存游戏、所有者、冻结
+名单和创建、更新、过期时间。同一游戏中每名玩家最多占用一个世界；双人名单共享一份，
+任一成员再次发起相同名单都会复用原所有者目录。实例退出时先以 staging 和原子替换方式
+回写世界，再删除临时运行目录；`session.lock` 不会进入持久副本。
+
+成功创建、启动和退出都会把过期时间延长 `solo_retention_days`，默认 10 天。Scheduler
+每天使用宿主机本地时区在 04:00 清理已过期且未运行的玩家世界；04:00 后启动时会补跑
+当天清理，运行中的世界不会被删除。
+
 ## CLI
 
 启动 Scheduler 后台进程：
@@ -322,10 +362,15 @@ POST /admin/v1/servers/<server-id>/terminate
 POST /admin/v1/servers/<server-id>/restart
 GET  /admin/v1/servers/<server-id>/logs?lines=100
 POST /admin/v1/servers/<server-id>/command
+GET  /admin/v1/solo/sessions
+POST /admin/v1/solo/sessions
+POST /admin/v1/solo/sessions/<session-id>/start
+POST /admin/v1/solo/sessions/<session-id>/destroy
 POST /admin/v1/system/shutdown
 ```
 
-Bridge 接口使用 `Authorization: Bearer <bridge.token>`。Bridge POST 请求采用
+Bridge 接口使用 `Authorization: Bearer <bridge.token>`。除通用
+`/bridge/v1/solo/sessions` 管理接口使用 JSON 外，Bridge POST 请求采用
 `application/x-www-form-urlencoded`，实例与待传送任务列表采用 TSV 文本：
 
 ```text
@@ -336,6 +381,13 @@ POST /bridge/v1/players
 GET  /bridge/v1/players
 GET  /bridge/v1/definitions
 GET  /bridge/v1/games
+GET  /bridge/v1/solo/access
+POST /bridge/v1/solo/<game-id>/launch
+POST /bridge/v1/solo/<game-id>/destroy
+GET  /bridge/v1/solo/sessions
+POST /bridge/v1/solo/sessions
+POST /bridge/v1/solo/sessions/<session-id>/start
+POST /bridge/v1/solo/sessions/<session-id>/destroy
 GET  /bridge/v1/servers
 POST /bridge/v1/servers/<server-id>/launch
 POST /bridge/v1/servers/<server-id>/transfers
@@ -346,6 +398,17 @@ POST /bridge/v1/servers/<server-id>/command
 GET  /bridge/v1/transfers
 POST /bridge/v1/transfers/result
 ```
+
+`POST /bridge/v1/solo/<game-id>/launch` 接收表单字段 `owner=<uuid>` 和
+`players=<comma-separated-uuid-list>`。`owner` 必须包含在 `players` 中，所有玩家必须
+当前连接到 Velocity。返回值与普通启动接口相同，为 5 列实例 TSV。
+`POST /bridge/v1/solo/<game-id>/destroy` 接收 `player=<uuid>`，只用于销毁
+`player_world`。`GET /bridge/v1/solo/access` 每行输出
+`base64(server-id)<TAB>instance-uuid<TAB>open|roster<TAB>comma-separated-uuid-list`。
+Velocity 应先匹配当前实例 UUID；`open` 允许任意玩家进入，`roster` 只允许最后一列的
+冻结名单进入。
+`GET /bridge/v1/games` 在原有 12 列后追加 `solo`、Base64 编码的 `solo_mode`、Base64
+编码的 `solo_startup`、`solo_max_players` 和 `solo_retention_days`，共 17 列。
 
 传送失败后，Scheduler 会按照 `bridge.transfer_retry_seconds` 重新提供任务，但只在
 `bridge.transfer_timeout_seconds` 内且不超过 `bridge.transfer_max_attempts`。玩家已经

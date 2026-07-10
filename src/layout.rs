@@ -12,6 +12,7 @@ use crate::config::{
   ServerDefinition, WorldDefinition,
 };
 use crate::dependency_cache::{self, DependencySnapshot};
+use crate::solo::{self, SoloPersistence};
 
 #[derive(Debug, Clone)]
 pub struct PreparedInstance {
@@ -27,12 +28,39 @@ pub struct PreparedInstance {
   pub dependency_snapshot: DependencySnapshot,
 }
 
+struct InstanceIdentity<'a> {
+  definition_id: &'a str,
+  runtime_id: &'a str,
+  instance_id: Uuid,
+  port: u16,
+}
+
 pub async fn prepare(
   config: &LoadedConfig,
   server_id: &str,
   port: u16,
 ) -> Result<PreparedInstance, LayoutError> {
-  let definition = config.load_server(server_id).await?;
+  prepare_instance(config, server_id, server_id, port, None).await
+}
+
+pub async fn prepare_solo(
+  config: &LoadedConfig,
+  definition_id: &str,
+  runtime_id: &str,
+  port: u16,
+  persistence: &SoloPersistence,
+) -> Result<PreparedInstance, LayoutError> {
+  prepare_instance(config, definition_id, runtime_id, port, Some(persistence)).await
+}
+
+async fn prepare_instance(
+  config: &LoadedConfig,
+  definition_id: &str,
+  runtime_id: &str,
+  port: u16,
+  persistence: Option<&SoloPersistence>,
+) -> Result<PreparedInstance, LayoutError> {
+  let definition = config.load_server(definition_id).await?;
   let instance_id = Uuid::new_v4();
   let runtime_root = config.resolve(&config.value.paths.runtime);
   let logs_root = config.resolve(&config.value.paths.logs);
@@ -48,7 +76,7 @@ pub async fn prepare(
       path: logs_root.clone(),
       source,
     })?;
-  let work_dir = runtime_root.join(format!("{server_id}-{instance_id}"));
+  let work_dir = runtime_root.join(format!("{runtime_id}-{instance_id}"));
   fs::create_dir(&work_dir)
     .await
     .map_err(|source| LayoutError::Io {
@@ -58,12 +86,16 @@ pub async fn prepare(
 
   let result = prepare_inner(
     config,
-    server_id,
-    instance_id,
-    port,
+    InstanceIdentity {
+      definition_id,
+      runtime_id,
+      instance_id,
+      port,
+    },
     definition,
     work_dir.clone(),
     logs_root,
+    persistence,
   )
   .await;
   if result.is_err() {
@@ -74,12 +106,11 @@ pub async fn prepare(
 
 async fn prepare_inner(
   config: &LoadedConfig,
-  server_id: &str,
-  instance_id: Uuid,
-  port: u16,
+  identity: InstanceIdentity<'_>,
   definition: ServerDefinition,
   work_dir: PathBuf,
   logs_root: PathBuf,
+  persistence: Option<&SoloPersistence>,
 ) -> Result<PreparedInstance, LayoutError> {
   let core_root = config
     .resolve(&config.value.paths.cores)
@@ -115,7 +146,9 @@ async fn prepare_inner(
     install_mod(config, &definition, module, &work_dir, &mods_dir).await?;
   }
 
-  if let WorldDefinition::Template { id } = &definition.world {
+  if persistence.is_none()
+    && let WorldDefinition::Template { id } = &definition.world
+  {
     let source = config.resolve(&config.value.paths.worlds).join(id);
     ensure_exists(&source).await?;
     copy_contents(&source, &work_dir).await?;
@@ -125,11 +158,15 @@ async fn prepare_inner(
     install_file_layer(config, layer, &work_dir).await?;
   }
 
-  dependency_cache::materialize(config, server_id, &work_dir).await?;
+  dependency_cache::materialize(config, identity.definition_id, &work_dir).await?;
+
+  if let Some(persistence) = persistence {
+    solo::materialize_world(persistence, &work_dir.join("world")).await?;
+  }
 
   write_properties(
     &work_dir.join("server.properties"),
-    port,
+    identity.port,
     !definition.core.kind.eq_ignore_ascii_case("velocity"),
     &definition.properties,
   )
@@ -146,9 +183,9 @@ async fn prepare_inner(
       &work_dir.join(path),
       config,
       &definition,
-      server_id,
-      instance_id,
-      port,
+      identity.runtime_id,
+      identity.instance_id,
+      identity.port,
     )
     .await?;
   }
@@ -164,21 +201,31 @@ async fn prepare_inner(
     .environment
     .iter()
     .map(|(name, value)| {
-      render_value(value, config, &definition, server_id, instance_id, port)
-        .map(|value| (name.clone(), value))
+      render_value(
+        value,
+        config,
+        &definition,
+        identity.runtime_id,
+        identity.instance_id,
+        identity.port,
+      )
+      .map(|value| (name.clone(), value))
     })
     .collect::<Result<BTreeMap<_, _>, _>>()?;
   let dependency_snapshot = dependency_cache::snapshot(&work_dir).await?;
 
   Ok(PreparedInstance {
-    server_id: server_id.to_string(),
-    instance_id,
-    port,
+    server_id: identity.runtime_id.to_string(),
+    instance_id: identity.instance_id,
+    port: identity.port,
     definition,
     work_dir,
     java_bin,
     server_jar,
-    log_file: logs_root.join(format!("{server_id}-{instance_id}.log")),
+    log_file: logs_root.join(format!(
+      "{}-{}.log",
+      identity.runtime_id, identity.instance_id
+    )),
     environment,
     dependency_snapshot,
   })
@@ -705,6 +752,8 @@ pub enum LayoutError {
   Dependency(#[from] dependency_cache::DependencyError),
   #[error(transparent)]
   Config(#[from] crate::config::ConfigError),
+  #[error(transparent)]
+  Solo(#[from] crate::solo::SoloError),
   #[error("failed to access {path}: {source}")]
   Io {
     path: PathBuf,

@@ -18,7 +18,8 @@ use crate::{
   manager::{InstanceManager, ManagerError},
   protocol::{
     CommandRequest, CommandResponse, HeartbeatForm, IdleForm, LaunchRequest, LogResponse,
-    PlayerListForm, PlayerPresence, PlayersForm, ReadyForm, TransferResultForm,
+    PlayerListForm, PlayerPresence, PlayersForm, ReadyForm, SoloDestroyForm, SoloLaunchForm,
+    SoloSessionCreateRequest, SoloSessionInfo, TransferResultForm,
   },
 };
 
@@ -43,6 +44,18 @@ pub fn router(state: ApiState) -> Router {
     .route("/servers/{server_id}/restart", post(restart_server))
     .route("/servers/{server_id}/logs", get(server_logs))
     .route("/servers/{server_id}/command", post(server_command))
+    .route(
+      "/solo/sessions",
+      get(list_solo_sessions).post(create_solo_session),
+    )
+    .route(
+      "/solo/sessions/{session_id}/start",
+      post(start_solo_session),
+    )
+    .route(
+      "/solo/sessions/{session_id}/destroy",
+      post(destroy_solo_session),
+    )
     .route("/system/shutdown", post(shutdown))
     .route_layer(middleware::from_fn_with_state(
       AuthState {
@@ -60,6 +73,21 @@ pub fn router(state: ApiState) -> Router {
     )
     .route("/definitions", get(bridge_definitions))
     .route("/games", get(bridge_games))
+    .route("/solo/access", get(bridge_solo_access))
+    .route("/solo/{game_id}/launch", post(bridge_solo_launch))
+    .route("/solo/{game_id}/destroy", post(bridge_solo_destroy))
+    .route(
+      "/solo/sessions",
+      get(list_solo_sessions).post(create_solo_session),
+    )
+    .route(
+      "/solo/sessions/{session_id}/start",
+      post(start_solo_session),
+    )
+    .route(
+      "/solo/sessions/{session_id}/destroy",
+      post(destroy_solo_session),
+    )
     .route("/servers", get(bridge_servers))
     .route("/servers/{server_id}/launch", post(bridge_launch))
     .route(
@@ -177,6 +205,33 @@ async fn server_command(
   }))
 }
 
+async fn list_solo_sessions(State(state): State<ApiState>) -> Json<Vec<SoloSessionInfo>> {
+  Json(state.manager.solo_sessions().await)
+}
+
+async fn create_solo_session(
+  State(state): State<ApiState>,
+  Json(request): Json<SoloSessionCreateRequest>,
+) -> Result<(StatusCode, Json<SoloSessionInfo>), ApiError> {
+  let session = state.manager.create_solo_session(request).await?;
+  Ok((StatusCode::CREATED, Json(session)))
+}
+
+async fn start_solo_session(
+  State(state): State<ApiState>,
+  Path(session_id): Path<String>,
+) -> Result<(StatusCode, Json<SoloSessionInfo>), ApiError> {
+  let session = state.manager.start_solo_session(&session_id).await?;
+  Ok((StatusCode::ACCEPTED, Json(session)))
+}
+
+async fn destroy_solo_session(
+  State(state): State<ApiState>,
+  Path(session_id): Path<String>,
+) -> Result<Json<Option<crate::protocol::InstanceInfo>>, ApiError> {
+  Ok(Json(state.manager.destroy_solo_session(&session_id).await?))
+}
+
 async fn shutdown(State(state): State<ApiState>) -> StatusCode {
   let _ = state.shutdown.send(());
   StatusCode::ACCEPTED
@@ -264,24 +319,96 @@ async fn bridge_games(State(state): State<ApiState>) -> Result<String, ApiError>
   Ok(
     games
       .into_iter()
-      .map(|(server_id, game)| {
-        format!(
-          "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-          game.order,
-          encode_game_field(&game.id),
-          encode_game_field(&server_id),
-          encode_game_field(&game.name),
-          encode_game_field(&game.description.join("\u{1f}")),
-          encode_game_field(&game.material),
-          game.custom_model_data,
-          encode_game_field(game.version.as_deref().unwrap_or_default()),
-          encode_game_field(game.min_version.as_deref().unwrap_or_default()),
-          encode_game_field(game.max_version.as_deref().unwrap_or_default()),
-          game.min_players,
-          game.max_players
+      .map(|(server_id, game)| format_game_catalog_entry(&server_id, &game))
+      .collect(),
+  )
+}
+
+async fn bridge_solo_access(State(state): State<ApiState>) -> Result<String, ApiError> {
+  Ok(
+    state
+      .manager
+      .solo_access()
+      .await?
+      .into_iter()
+      .map(|entry| {
+        format_solo_access(
+          &entry.server_id,
+          entry.instance_id,
+          entry.access.as_str(),
+          &entry.players,
         )
       })
       .collect(),
+  )
+}
+
+fn format_solo_access(
+  server_id: &str,
+  instance_id: uuid::Uuid,
+  access: &str,
+  players: &[uuid::Uuid],
+) -> String {
+  format!(
+    "{}\t{}\t{}\t{}\n",
+    encode_game_field(server_id),
+    instance_id,
+    access,
+    players
+      .iter()
+      .map(uuid::Uuid::to_string)
+      .collect::<Vec<_>>()
+      .join(",")
+  )
+}
+
+async fn bridge_solo_launch(
+  State(state): State<ApiState>,
+  Path(game_id): Path<String>,
+  Form(form): Form<SoloLaunchForm>,
+) -> Result<String, ApiError> {
+  let instance = state
+    .manager
+    .launch_solo(&game_id, form.owner, parse_uuid_list(&form.players)?)
+    .await?;
+  Ok(format_bridge_instance(&instance))
+}
+
+async fn bridge_solo_destroy(
+  State(state): State<ApiState>,
+  Path(game_id): Path<String>,
+  Form(form): Form<SoloDestroyForm>,
+) -> Result<StatusCode, ApiError> {
+  state
+    .manager
+    .destroy_solo_for_player(&game_id, form.player)
+    .await?;
+  Ok(StatusCode::NO_CONTENT)
+}
+
+fn format_game_catalog_entry(
+  server_id: &str,
+  game: &crate::config::GameVotingDefinition,
+) -> String {
+  format!(
+    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+    game.order,
+    encode_game_field(&game.id),
+    encode_game_field(server_id),
+    encode_game_field(&game.name),
+    encode_game_field(&game.description.join("\u{1f}")),
+    encode_game_field(&game.material),
+    game.custom_model_data,
+    encode_game_field(game.version.as_deref().unwrap_or_default()),
+    encode_game_field(game.min_version.as_deref().unwrap_or_default()),
+    encode_game_field(game.max_version.as_deref().unwrap_or_default()),
+    game.min_players,
+    game.max_players,
+    game.solo,
+    encode_game_field(game.solo_mode.as_str()),
+    encode_game_field(game.solo_startup.as_str()),
+    game.solo_max_players,
+    game.solo_retention_days
   )
 }
 
@@ -380,6 +507,22 @@ fn parse_player_list(value: &str) -> Vec<String> {
     .map(str::trim)
     .filter(|value| !value.is_empty())
     .map(str::to_string)
+    .collect()
+}
+
+fn parse_uuid_list(value: &str) -> Result<Vec<uuid::Uuid>, ApiError> {
+  value
+    .split([',', '\n'])
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(|value| {
+      value.parse().map_err(|_| {
+        ApiError::new(
+          StatusCode::BAD_REQUEST,
+          format!("invalid player UUID: {value}"),
+        )
+      })
+    })
     .collect()
 }
 
@@ -486,8 +629,12 @@ impl From<ManagerError> for ApiError {
   fn from(error: ManagerError) -> Self {
     let status = match error {
       ManagerError::AlreadyRunning(_) => StatusCode::CONFLICT,
+      ManagerError::Solo(crate::solo::SoloError::AlreadyExists(_)) => StatusCode::CONFLICT,
       ManagerError::NotFound(_) | ManagerError::NotRunning(_) => StatusCode::NOT_FOUND,
-      ManagerError::Layout(_) | ManagerError::State(_) => StatusCode::BAD_REQUEST,
+      ManagerError::Layout(_)
+      | ManagerError::State(_)
+      | ManagerError::Solo(crate::solo::SoloError::MissingWorld(_))
+      | ManagerError::Solo(crate::solo::SoloError::InvalidWorld(_)) => StatusCode::BAD_REQUEST,
       _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     tracing::error!(%error, "API request failed");
@@ -521,6 +668,62 @@ mod tests {
     let mut headers = HeaderMap::new();
     headers.insert(AUTHORIZATION, "Basic test".parse().unwrap());
     assert!(!valid_bearer(&headers, "01234567890123456789012345678901"));
+  }
+
+  #[test]
+  fn game_catalog_includes_solo_fields() {
+    let game = serde_json::from_value(serde_json::json!({
+      "id": "puzzle",
+      "name": "Puzzle",
+      "material": "COMPASS",
+      "solo": true,
+      "solo_mode": "player_world",
+      "solo_startup": "on_demand",
+      "solo_max_players": 2,
+      "solo_retention_days": 10
+    }))
+    .unwrap();
+    let line = format_game_catalog_entry("puzzle-server", &game);
+    let fields = line.trim_end_matches('\n').split('\t').collect::<Vec<_>>();
+    assert_eq!(fields.len(), 17);
+    assert_eq!(fields[12], "true");
+    assert_eq!(STANDARD_NO_PAD.decode(fields[13]).unwrap(), b"player_world");
+    assert_eq!(STANDARD_NO_PAD.decode(fields[14]).unwrap(), b"on_demand");
+    assert_eq!(&fields[15..], ["2", "10"]);
+  }
+
+  #[test]
+  fn solo_access_encodes_server_id_and_players() {
+    let instance = "00000000-0000-0000-0000-000000000010".parse().unwrap();
+    let first = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+    let second = "00000000-0000-0000-0000-000000000002".parse().unwrap();
+    let line = format_solo_access("puzzle-solo", instance, "roster", &[first, second]);
+    let fields = line.trim_end_matches('\n').split('\t').collect::<Vec<_>>();
+    assert_eq!(fields.len(), 4);
+    assert_eq!(STANDARD_NO_PAD.decode(fields[0]).unwrap(), b"puzzle-solo");
+    assert_eq!(
+      fields[3],
+      "00000000-0000-0000-0000-000000000001,00000000-0000-0000-0000-000000000002"
+    );
+    assert_eq!(fields[1], instance.to_string());
+    assert_eq!(fields[2], "roster");
+  }
+
+  #[test]
+  fn solo_open_access_keeps_empty_player_column() {
+    let instance = "00000000-0000-0000-0000-000000000010".parse().unwrap();
+    let line = format_solo_access("shared", instance, "open", &[]);
+    let fields = line.trim_end_matches('\n').split('\t').collect::<Vec<_>>();
+    assert_eq!(fields.len(), 4);
+    assert_eq!(fields[2], "open");
+    assert_eq!(fields[3], "");
+  }
+
+  #[test]
+  fn solo_player_list_rejects_invalid_uuid() {
+    let error = parse_uuid_list("not-a-uuid").unwrap_err();
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.message, "invalid player UUID: not-a-uuid");
   }
 
   #[test]

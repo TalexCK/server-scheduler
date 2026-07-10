@@ -7,6 +7,7 @@ mod manager;
 mod network;
 mod protocol;
 mod runtime;
+mod solo;
 
 use std::{
   fs::{self, OpenOptions},
@@ -127,8 +128,9 @@ async fn run_daemon(config: Arc<LoadedConfig>) -> Result<(), Box<dyn std::error:
   let runtime_root = config.resolve(&config.value.paths.runtime);
   clear_runtime_directory(&runtime_root).await?;
   runtime::clear_staging(&runtime_root).await?;
-  let frpc = network::FrpcService::start(config.clone()).await?;
   let manager = InstanceManager::new(config.clone());
+  manager.initialize().await?;
+  let frpc = network::FrpcService::start(config.clone()).await?;
   let monitor = manager.clone();
   tokio::spawn(async move { monitor.monitor().await });
   let (shutdown, mut shutdown_receiver) = broadcast::channel(4);
