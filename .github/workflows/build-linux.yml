@@ -1,0 +1,45 @@
+name: Build Linux
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-x86_64
+
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
+      - name: Build release binary
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Package binary
+        run: |
+          strip target/x86_64-unknown-linux-gnu/release/server-scheduler
+          tar -C target/x86_64-unknown-linux-gnu/release -czf server-scheduler-linux-x86_64.tar.gz server-scheduler
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: server-scheduler-linux-x86_64-${{ github.sha }}
+          path: server-scheduler-linux-x86_64.tar.gz
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
