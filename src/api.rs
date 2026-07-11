@@ -80,9 +80,10 @@ pub fn router(state: ApiState) -> Router {
       "/solo/sessions",
       get(list_solo_sessions).post(create_solo_session),
     )
+    .route("/solo/session-index", get(bridge_list_solo_sessions))
     .route(
       "/solo/sessions/{session_id}/start",
-      post(start_solo_session),
+      post(bridge_start_solo_session),
     )
     .route(
       "/solo/sessions/{session_id}/destroy",
@@ -340,6 +341,60 @@ async fn bridge_solo_access(State(state): State<ApiState>) -> Result<String, Api
         )
       })
       .collect(),
+  )
+}
+
+async fn bridge_list_solo_sessions(State(state): State<ApiState>) -> String {
+  state
+    .manager
+    .solo_sessions()
+    .await
+    .into_iter()
+    .map(|session| {
+      format_solo_session(
+        &session.game_id,
+        &session.session_id,
+        session.owner,
+        &session.players,
+      )
+    })
+    .collect()
+}
+
+async fn bridge_start_solo_session(
+  State(state): State<ApiState>,
+  Path(session_id): Path<String>,
+  Form(form): Form<PlayersForm>,
+) -> Result<String, ApiError> {
+  let session = state
+    .manager
+    .start_solo_session_for_players(&session_id, parse_uuid_list(&form.players)?)
+    .await?;
+  let instance = session.instance.ok_or_else(|| {
+    ApiError::new(
+      StatusCode::INTERNAL_SERVER_ERROR,
+      "solo session started without an instance",
+    )
+  })?;
+  Ok(format_bridge_instance(&instance))
+}
+
+fn format_solo_session(
+  game_id: &str,
+  session_id: &str,
+  owner: uuid::Uuid,
+  players: &[uuid::Uuid],
+) -> String {
+  format!(
+    "{}\t{}\t{}\t{}\n",
+    encode_game_field(game_id),
+    encode_game_field(session_id),
+    owner,
+    players
+      .iter()
+      .map(uuid::Uuid::to_string)
+      .collect::<Vec<_>>()
+      .join(",")
   )
 }
 
@@ -707,6 +762,19 @@ mod tests {
     );
     assert_eq!(fields[1], instance.to_string());
     assert_eq!(fields[2], "roster");
+  }
+
+  #[test]
+  fn solo_session_encodes_identity_and_roster() {
+    let owner = uuid::Uuid::from_u128(1);
+    let teammate = uuid::Uuid::from_u128(2);
+    let line = format_solo_session("puzzle", "puzzle-owner", owner, &[owner, teammate]);
+    let fields = line.trim().split('\t').collect::<Vec<_>>();
+    assert_eq!(fields.len(), 4);
+    assert_eq!(STANDARD_NO_PAD.decode(fields[0]).unwrap(), b"puzzle");
+    assert_eq!(STANDARD_NO_PAD.decode(fields[1]).unwrap(), b"puzzle-owner");
+    assert_eq!(fields[2], owner.to_string());
+    assert_eq!(fields[3], format!("{owner},{teammate}"));
   }
 
   #[test]

@@ -71,6 +71,7 @@ struct InstanceControl {
   daily_restart: Option<DailyRestartDefinition>,
   daily_restart_tracker: Mutex<DailyRestartTracker>,
   idle_timeout_seconds: Option<u64>,
+  operator_players: bool,
   launch_spec: LaunchSpec,
   solo_mode: Option<SoloMode>,
   solo_session_id: Arc<Mutex<Option<String>>>,
@@ -404,9 +405,9 @@ impl InstanceManager {
     }
     let players = normalize_solo_players(request.owner, request.players);
     validate_solo_roster(&game.definition, request.owner, &players)?;
-    self.ensure_solo_players_online(&players).await?;
     let _operations = self.solo_operations.lock().await;
     if game.definition.solo_mode == SoloMode::Shared {
+      self.ensure_solo_players_online(&players).await?;
       let record = self
         .upsert_shared_solo_session(&game, request.owner, players)
         .await;
@@ -437,6 +438,7 @@ impl InstanceManager {
         existing.session_id
       )));
     }
+    self.ensure_solo_players_online(&players).await?;
     let timestamp = now();
     let (persistence, metadata) = solo::create_storage(
       &self.config.resolve(&self.config.value.paths.worlds),
@@ -507,6 +509,24 @@ impl InstanceManager {
     &self,
     session_id: &str,
   ) -> Result<SoloSessionInfo, ManagerError> {
+    self.start_solo_session_with_players(session_id, None).await
+  }
+
+  pub async fn start_solo_session_for_players(
+    &self,
+    session_id: &str,
+    requested_players: Vec<Uuid>,
+  ) -> Result<SoloSessionInfo, ManagerError> {
+    self
+      .start_solo_session_with_players(session_id, Some(requested_players))
+      .await
+  }
+
+  async fn start_solo_session_with_players(
+    &self,
+    session_id: &str,
+    requested_players: Option<Vec<Uuid>>,
+  ) -> Result<SoloSessionInfo, ManagerError> {
     let initial = self
       .solo_sessions
       .read()
@@ -514,7 +534,14 @@ impl InstanceManager {
       .get(session_id)
       .cloned()
       .ok_or_else(|| ManagerError::NotFound(session_id.to_string()))?;
-    self.ensure_solo_players_online(&initial.players).await?;
+    let requested = requested_players.unwrap_or_else(|| initial.players.clone());
+    self.validate_solo_requested_players(&initial, &requested)?;
+    let transfer_players = if initial.mode == SoloMode::PlayerWorld {
+      self.wait_for_online_solo_players(&requested).await?
+    } else {
+      self.ensure_solo_players_online(&requested).await?;
+      requested
+    };
     let _operations = self.solo_operations.lock().await;
     let record = self
       .solo_sessions
@@ -523,8 +550,14 @@ impl InstanceManager {
       .get(session_id)
       .cloned()
       .ok_or_else(|| ManagerError::NotFound(session_id.to_string()))?;
-    let player_ids = record
-      .players
+    self.validate_solo_requested_players(&record, &transfer_players)?;
+    let online_players = self.online_solo_players(&transfer_players).await;
+    if online_players.is_empty() {
+      return Err(ManagerError::State(
+        "none of the requested solo players are connected to Velocity".into(),
+      ));
+    }
+    let player_ids = online_players
       .iter()
       .map(Uuid::to_string)
       .collect::<Vec<_>>();
@@ -589,11 +622,33 @@ impl InstanceManager {
     if game.definition.solo_mode == SoloMode::Shared {
       return self.launch_shared_solo(game, owner, players).await;
     }
+    if !players.contains(&owner) {
+      return Err(ManagerError::State(
+        "solo session owner must be included in players".into(),
+      ));
+    }
+    let requested_players = normalize_solo_players(owner, players);
+    let existing = self
+      .solo_sessions
+      .read()
+      .await
+      .values()
+      .find(|session| session.game_id == game_id && session.players.contains(&owner))
+      .cloned();
+    if let Some(existing) = existing {
+      self.validate_solo_requested_players(&existing, &requested_players)?;
+      self.ensure_solo_players_online(&[owner]).await?;
+      return self
+        .start_solo_session_for_players(&existing.session_id, requested_players)
+        .await?
+        .instance
+        .ok_or_else(|| ManagerError::State("solo instance did not start".into()));
+    }
     let session = self
       .create_solo_session(SoloSessionCreateRequest {
         game_id: game_id.to_string(),
         owner,
-        players,
+        players: requested_players,
       })
       .await?;
     self
@@ -798,6 +853,55 @@ impl InstanceManager {
       }
       sleep(SOLO_ONLINE_RETRY).await;
     }
+  }
+
+  async fn wait_for_online_solo_players(
+    &self,
+    players: &[Uuid],
+  ) -> Result<Vec<Uuid>, ManagerError> {
+    let deadline = Instant::now() + SOLO_ONLINE_WAIT;
+    loop {
+      let online = self.online_solo_players(players).await;
+      if !online.is_empty() {
+        return Ok(online);
+      }
+      if Instant::now() >= deadline {
+        return Err(ManagerError::State(
+          "none of the requested solo players are connected to Velocity".into(),
+        ));
+      }
+      sleep(SOLO_ONLINE_RETRY).await;
+    }
+  }
+
+  async fn online_solo_players(&self, players: &[Uuid]) -> Vec<Uuid> {
+    let online = self.players.read().await;
+    players
+      .iter()
+      .copied()
+      .filter(|player| online.contains_key(player))
+      .collect()
+  }
+
+  fn validate_solo_requested_players(
+    &self,
+    session: &SoloSessionRecord,
+    players: &[Uuid],
+  ) -> Result<(), ManagerError> {
+    if players.is_empty() {
+      return Err(ManagerError::State(
+        "at least one solo player must be requested".into(),
+      ));
+    }
+    for player in players {
+      if !session.players.contains(player) {
+        return Err(ManagerError::State(format!(
+          "player {player} is not assigned to solo session {}",
+          session.session_id
+        )));
+      }
+    }
+    Ok(())
   }
 
   async fn wait_for_launch_registration(&self, runtime_id: &str) {
@@ -1020,6 +1124,7 @@ impl InstanceManager {
         .flatten(),
       daily_restart_tracker: Mutex::new(DailyRestartTracker::default()),
       idle_timeout_seconds: prepared.definition.idle_timeout_seconds,
+      operator_players: prepared.definition.operator_players,
       launch_spec: spec.clone(),
       solo_mode,
       solo_session_id: solo_session_id.clone(),
@@ -1133,10 +1238,14 @@ impl InstanceManager {
     let state = instance.info.read().await.state;
     match state {
       InstanceState::Starting => {
+        if instance.operator_players {
+          self.operator_usernames(&players).await?;
+        }
         instance.pending_players.lock().await.extend(players);
         Ok(())
       }
       InstanceState::Ready => {
+        self.grant_transfer_operators(&instance, &players).await?;
         let port = instance.info.read().await.port;
         self.enqueue_transfers(server_id, port, players).await;
         Ok(())
@@ -1320,18 +1429,7 @@ impl InstanceManager {
       return Err(ManagerError::NotRunning(server_id.to_string()));
     }
     let mut log_receiver = instance.logs.sender.subscribe();
-    let (sender, receiver) = oneshot::channel();
-    instance
-      .control
-      .send(ProcessControl::Command {
-        value: command,
-        response: sender,
-      })
-      .await
-      .map_err(|_| ManagerError::State("process supervisor is unavailable".into()))?;
-    receiver.await.map_err(|_| {
-      ManagerError::State("process supervisor dropped the command response".into())
-    })??;
+    self.write_instance_command(&instance, command).await?;
 
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut output = Vec::new();
@@ -1352,6 +1450,71 @@ impl InstanceManager {
       }
     }
     Ok(output)
+  }
+
+  async fn grant_transfer_operators(
+    &self,
+    instance: &InstanceControl,
+    players: &[String],
+  ) -> Result<(), ManagerError> {
+    if !instance.operator_players || players.is_empty() {
+      return Ok(());
+    }
+    for username in self.operator_usernames(players).await? {
+      self
+        .write_instance_command(instance, format!("op {username}"))
+        .await
+        .map_err(|error| {
+          ManagerError::State(format!(
+            "failed to grant operator status to {username}: {error}"
+          ))
+        })?;
+    }
+    Ok(())
+  }
+
+  async fn operator_usernames(&self, players: &[String]) -> Result<Vec<String>, ManagerError> {
+    let presence = self.players.read().await;
+    let mut usernames = BTreeSet::new();
+    for player in players {
+      let uuid = player.parse::<Uuid>().map_err(|_| {
+        ManagerError::State(format!(
+          "operator player identifier is not a UUID: {player}"
+        ))
+      })?;
+      let current = presence.get(&uuid).ok_or_else(|| {
+        ManagerError::State(format!(
+          "online Velocity presence is unavailable for operator player {player}"
+        ))
+      })?;
+      if !valid_minecraft_username(&current.username) {
+        return Err(ManagerError::State(format!(
+          "Velocity presence contains an invalid Minecraft username for player {player}"
+        )));
+      }
+      usernames.insert(current.username.clone());
+    }
+    Ok(usernames.into_iter().collect())
+  }
+
+  async fn write_instance_command(
+    &self,
+    instance: &InstanceControl,
+    command: String,
+  ) -> Result<(), ManagerError> {
+    let (sender, receiver) = oneshot::channel();
+    instance
+      .control
+      .send(ProcessControl::Command {
+        value: command,
+        response: sender,
+      })
+      .await
+      .map_err(|_| ManagerError::State("process supervisor is unavailable".into()))?;
+    receiver.await.map_err(|_| {
+      ManagerError::State("process supervisor dropped the command response".into())
+    })??;
+    Ok(())
   }
 
   pub async fn logs(&self, server_id: &str, count: usize) -> Result<Vec<String>, ManagerError> {
@@ -1410,11 +1573,24 @@ impl InstanceManager {
       info.state = InstanceState::Ready;
       info.last_heartbeat = Some(now());
     }
-    if already_ready {
+    let players = instance
+      .pending_players
+      .lock()
+      .await
+      .iter()
+      .cloned()
+      .collect::<Vec<_>>();
+    if already_ready && players.is_empty() {
       return Ok(());
     }
+    self.grant_transfer_operators(&instance, &players).await?;
     let port = instance.info.read().await.port;
-    let players = instance.pending_players.lock().await.drain().collect();
+    let authorized = players.iter().cloned().collect::<HashSet<_>>();
+    instance
+      .pending_players
+      .lock()
+      .await
+      .retain(|player| !authorized.contains(player));
     self.enqueue_transfers(server_id, port, players).await;
     Ok(())
   }
@@ -2190,6 +2366,13 @@ fn validate_players(players: &[String]) -> Result<(), ManagerError> {
   Ok(())
 }
 
+fn valid_minecraft_username(username: &str) -> bool {
+  (3..=16).contains(&username.len())
+    && username
+      .chars()
+      .all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
 fn normalize_solo_players(owner: Uuid, players: Vec<Uuid>) -> Vec<Uuid> {
   let mut unique = players.into_iter().collect::<BTreeSet<_>>();
   unique.remove(&owner);
@@ -2361,6 +2544,14 @@ mod tests {
     mode: SoloMode,
     startup: SoloStartup,
   ) -> (tempfile::TempDir, InstanceManager) {
+    solo_test_manager_with_operator(mode, startup, false).await
+  }
+
+  async fn solo_test_manager_with_operator(
+    mode: SoloMode,
+    startup: SoloStartup,
+    operator_players: bool,
+  ) -> (tempfile::TempDir, InstanceManager) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
     let port = NEXT_SOLO_TEST_PORT.fetch_add(1, Ordering::Relaxed);
@@ -2382,7 +2573,7 @@ mod tests {
     let java = root.join("java21/bin/java");
     fs::write(
       &java,
-      b"#!/bin/sh\nprintf 'started\\n'\nwhile IFS= read -r line; do\n  if [ \"$line\" = \"stop\" ]; then\n    exit 0\n  fi\ndone\n",
+      b"#!/bin/sh\nprintf 'started\\n'\nwhile IFS= read -r line; do\n  if [ \"$line\" = \"stop\" ]; then\n    exit 0\n  fi\n  printf '%s\\n' \"$line\" >> operator-commands.txt\ndone\n",
     )
     .await
     .unwrap();
@@ -2452,6 +2643,7 @@ mod tests {
           "maximum_mib": 256
         },
         "idle_timeout_seconds": 300,
+        "operator_players": operator_players,
         "gamevoting": {
           "id": "puzzle",
           "name": "Puzzle",
@@ -2486,6 +2678,21 @@ mod tests {
       ping_ms: 1,
       server_id: Some("Lobby".into()),
     }
+  }
+
+  async fn operator_commands(path: &Path) -> String {
+    timeout(Duration::from_secs(2), async {
+      loop {
+        if let Ok(content) = fs::read_to_string(path).await
+          && !content.is_empty()
+        {
+          return content;
+        }
+        sleep(Duration::from_millis(10)).await;
+      }
+    })
+    .await
+    .unwrap()
   }
 
   fn prepared_instance(
@@ -2542,6 +2749,7 @@ mod tests {
       })
       .await
       .unwrap();
+    manager.replace_players(vec![presence(second)]).await;
     let reused = manager
       .create_solo_session(SoloSessionCreateRequest {
         game_id: "puzzle".into(),
@@ -2568,6 +2776,342 @@ mod tests {
       .unwrap();
     assert_eq!(rebuilt.owner, second);
     assert_ne!(rebuilt.session_id, created.session_id);
+  }
+
+  #[tokio::test]
+  async fn starting_a_missing_solo_session_never_creates_one() {
+    let (_directory, manager) =
+      solo_test_manager(SoloMode::PlayerWorld, SoloStartup::OnDemand).await;
+    let player = Uuid::new_v4();
+    manager.replace_players(vec![presence(player)]).await;
+
+    let error = manager
+      .start_solo_session_for_players("missing-session", vec![player])
+      .await
+      .unwrap_err();
+
+    assert!(error.to_string().contains("missing-session"));
+    assert!(manager.solo_sessions().await.is_empty());
+    assert!(manager.list().await.is_empty());
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn frozen_player_world_can_be_started_by_online_member_only() {
+    let (_directory, manager) =
+      solo_test_manager(SoloMode::PlayerWorld, SoloStartup::OnDemand).await;
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    manager
+      .replace_players(vec![presence(first), presence(second)])
+      .await;
+    let session = manager
+      .create_solo_session(SoloSessionCreateRequest {
+        game_id: "puzzle".into(),
+        owner: first,
+        players: vec![first, second],
+      })
+      .await
+      .unwrap();
+
+    manager.replace_players(vec![presence(second)]).await;
+    let started = manager
+      .launch_solo("puzzle", second, vec![second, first])
+      .await
+      .unwrap();
+    let instance = manager.instance(&started.server_id).await.unwrap();
+    assert_eq!(
+      instance.pending_players.lock().await.clone(),
+      HashSet::from([second.to_string()])
+    );
+    let current = manager
+      .solo_sessions()
+      .await
+      .into_iter()
+      .find(|current| current.session_id == session.session_id)
+      .unwrap();
+    assert_eq!(current.owner, first);
+    assert_eq!(current.players, vec![first, second]);
+    manager.stop(&started.server_id).await.unwrap();
+
+    let restarted = manager
+      .start_solo_session_for_players(&session.session_id, vec![second])
+      .await
+      .unwrap();
+    let restarted = restarted.instance.unwrap();
+    let instance = manager.instance(&restarted.server_id).await.unwrap();
+    assert_eq!(
+      instance.pending_players.lock().await.clone(),
+      HashSet::from([second.to_string()])
+    );
+    manager.stop(&restarted.server_id).await.unwrap();
+  }
+
+  #[tokio::test]
+  async fn frozen_player_world_rejects_roster_changes() {
+    let (_directory, manager) =
+      solo_test_manager(SoloMode::PlayerWorld, SoloStartup::OnDemand).await;
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let outsider = Uuid::new_v4();
+    manager
+      .replace_players(vec![presence(first), presence(second), presence(outsider)])
+      .await;
+    let session = manager
+      .create_solo_session(SoloSessionCreateRequest {
+        game_id: "puzzle".into(),
+        owner: first,
+        players: vec![first, second],
+      })
+      .await
+      .unwrap();
+
+    let error = manager
+      .launch_solo("puzzle", second, vec![second, outsider])
+      .await
+      .unwrap_err();
+    assert!(
+      error
+        .to_string()
+        .contains("is not assigned to solo session")
+    );
+    let current = manager
+      .solo_sessions()
+      .await
+      .into_iter()
+      .find(|current| current.session_id == session.session_id)
+      .unwrap();
+    assert_eq!(current.owner, first);
+    assert_eq!(current.players, vec![first, second]);
+  }
+
+  #[tokio::test]
+  async fn starting_an_existing_session_rejects_players_outside_the_roster() {
+    let (_directory, manager) =
+      solo_test_manager(SoloMode::PlayerWorld, SoloStartup::OnDemand).await;
+    let owner = Uuid::new_v4();
+    let outsider = Uuid::new_v4();
+    manager
+      .replace_players(vec![presence(owner), presence(outsider)])
+      .await;
+    let session = manager
+      .create_solo_session(SoloSessionCreateRequest {
+        game_id: "puzzle".into(),
+        owner,
+        players: vec![owner],
+      })
+      .await
+      .unwrap();
+
+    let error = manager
+      .start_solo_session_for_players(&session.session_id, vec![outsider])
+      .await
+      .unwrap_err();
+
+    assert!(
+      error
+        .to_string()
+        .contains("is not assigned to solo session")
+    );
+    assert!(manager.list().await.is_empty());
+    assert_eq!(manager.solo_sessions().await.len(), 1);
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn existing_shared_session_starts_only_requested_players() {
+    let (_directory, manager) = solo_test_manager(SoloMode::Shared, SoloStartup::OnDemand).await;
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    manager
+      .replace_players(vec![presence(first), presence(second)])
+      .await;
+    let session = manager
+      .create_solo_session(SoloSessionCreateRequest {
+        game_id: "puzzle".into(),
+        owner: first,
+        players: vec![first, second],
+      })
+      .await
+      .unwrap();
+
+    let started = manager
+      .start_solo_session_for_players(&session.session_id, vec![second])
+      .await
+      .unwrap()
+      .instance
+      .unwrap();
+    let instance = manager.instance(&started.server_id).await.unwrap();
+
+    assert_eq!(
+      instance.pending_players.lock().await.clone(),
+      HashSet::from([second.to_string()])
+    );
+    manager.stop(&started.server_id).await.unwrap();
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn operator_players_covers_initial_and_ready_transfers() {
+    let (_directory, manager) =
+      solo_test_manager_with_operator(SoloMode::PlayerWorld, SoloStartup::OnDemand, true).await;
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let first_presence = presence(first);
+    let second_presence = presence(second);
+    let first_username = first_presence.username.clone();
+    let second_username = second_presence.username.clone();
+    manager
+      .replace_players(vec![first_presence, second_presence])
+      .await;
+    let session = manager
+      .create_solo_session(SoloSessionCreateRequest {
+        game_id: "puzzle".into(),
+        owner: first,
+        players: vec![first, second],
+      })
+      .await
+      .unwrap();
+    let started = manager
+      .start_solo_session_for_players(&session.session_id, vec![first])
+      .await
+      .unwrap()
+      .instance
+      .unwrap();
+
+    manager
+      .ready(&started.server_id, started.instance_id)
+      .await
+      .unwrap();
+    assert_eq!(
+      manager
+        .transfers
+        .lock()
+        .await
+        .values()
+        .map(|transfer| transfer.player.clone())
+        .collect::<HashSet<_>>(),
+      HashSet::from([first.to_string()])
+    );
+    let command_file = started.work_dir.join("operator-commands.txt");
+    assert_eq!(
+      operator_commands(&command_file).await,
+      format!("op {first_username}\n")
+    );
+
+    manager.transfers.lock().await.clear();
+    manager
+      .queue_transfers(&started.server_id, vec![second.to_string()])
+      .await
+      .unwrap();
+    assert_eq!(
+      manager
+        .transfers
+        .lock()
+        .await
+        .values()
+        .map(|transfer| transfer.player.clone())
+        .collect::<HashSet<_>>(),
+      HashSet::from([second.to_string()])
+    );
+    timeout(Duration::from_secs(2), async {
+      loop {
+        let commands = fs::read_to_string(&command_file).await.unwrap_or_default();
+        if commands.contains(&format!("op {second_username}\n")) {
+          assert_eq!(
+            commands,
+            format!("op {first_username}\nop {second_username}\n")
+          );
+          return;
+        }
+        sleep(Duration::from_millis(10)).await;
+      }
+    })
+    .await
+    .unwrap();
+    manager.stop(&started.server_id).await.unwrap();
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn operator_players_rejects_missing_or_invalid_presence() {
+    let (_directory, manager) =
+      solo_test_manager_with_operator(SoloMode::PlayerWorld, SoloStartup::OnDemand, true).await;
+    let player = Uuid::new_v4();
+    manager.replace_players(vec![presence(player)]).await;
+    let session = manager
+      .create_solo_session(SoloSessionCreateRequest {
+        game_id: "puzzle".into(),
+        owner: player,
+        players: vec![player],
+      })
+      .await
+      .unwrap();
+    let started = manager
+      .start_solo_session(&session.session_id)
+      .await
+      .unwrap()
+      .instance
+      .unwrap();
+    manager.replace_players(Vec::new()).await;
+    let missing = manager
+      .ready(&started.server_id, started.instance_id)
+      .await
+      .unwrap_err();
+    assert!(missing.to_string().contains("online Velocity presence"));
+    assert!(manager.transfers.lock().await.is_empty());
+
+    manager
+      .replace_players(vec![PlayerPresence {
+        uuid: player,
+        username: "bad-name".into(),
+        ping_ms: 1,
+        server_id: Some("Lobby".into()),
+      }])
+      .await;
+    let invalid = manager
+      .ready(&started.server_id, started.instance_id)
+      .await
+      .unwrap_err();
+    assert!(invalid.to_string().contains("invalid Minecraft username"));
+    assert!(manager.transfers.lock().await.is_empty());
+    manager.stop(&started.server_id).await.unwrap();
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn operator_players_does_not_transfer_when_command_write_fails() {
+    let (_directory, manager) =
+      solo_test_manager_with_operator(SoloMode::Shared, SoloStartup::OnDemand, true).await;
+    let player = Uuid::new_v4();
+    manager.replace_players(vec![presence(player)]).await;
+    let started = manager
+      .launch_with_spec(LaunchSpec::static_server("game"), Vec::new())
+      .await
+      .unwrap();
+    manager
+      .ready(&started.server_id, started.instance_id)
+      .await
+      .unwrap();
+    let instance = manager.instance(&started.server_id).await.unwrap();
+    manager.stop(&started.server_id).await.unwrap();
+    instance.info.write().await.state = InstanceState::Ready;
+
+    let error = manager
+      .queue_transfers(&started.server_id, vec![player.to_string()])
+      .await
+      .unwrap_err();
+    assert!(
+      error
+        .to_string()
+        .contains("failed to grant operator status")
+    );
+    assert!(
+      error
+        .to_string()
+        .contains("process supervisor is unavailable")
+    );
+    assert!(manager.transfers.lock().await.is_empty());
   }
 
   #[tokio::test]
@@ -3361,6 +3905,7 @@ mod tests {
         daily_restart: prepared.definition.daily_restart.clone(),
         daily_restart_tracker: Mutex::new(DailyRestartTracker::default()),
         idle_timeout_seconds: prepared.definition.idle_timeout_seconds,
+        operator_players: prepared.definition.operator_players,
         launch_spec: LaunchSpec::static_server("game"),
         solo_mode: None,
         solo_session_id: solo_session_id.clone(),

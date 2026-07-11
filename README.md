@@ -283,6 +283,11 @@ SCHEDULER_SERVER_PORT
 新启动或已手动重启的实例不会重复执行当天的计划重启。需要长期运行的服务器同时设置
 `autostart: true`。
 
+`operator_players` 默认为 `false`。启用后，Scheduler 会在每次创建传送任务前，根据
+Velocity 在线状态把玩家 UUID 解析为合法用户名，并先向目标子服写入 `op <username>`；
+写入失败、玩家已离线或用户名不合法时不会传送。该选项只应在已由 Solo roster 隔离、且
+地图功能确实要求玩家拥有服务端操作权限的实例中启用。
+
 `gamevoting.solo` 默认为 `false`。启用后，`solo_mode` 支持 `shared` 和
 `player_world`，`solo_startup` 支持 `always` 和 `on_demand`，默认分别为 `shared`
 和 `on_demand`。`solo_max_players` 限制单次启动请求人数；请求还必须同时满足游戏的
@@ -298,8 +303,9 @@ SCHEDULER_SERVER_PORT
 `worlds/<game-id>/world`，持久副本位于
 `worlds/<game-id>/<owner-uuid>/world`，旁边的 `config.json` 保存游戏、所有者、冻结
 名单和创建、更新、过期时间。同一游戏中每名玩家最多占用一个世界；双人名单共享一份，
-任一成员再次发起相同名单都会复用原所有者目录。实例退出时先以 staging 和原子替换方式
-回写世界，再删除临时运行目录；`session.lock` 不会进入持久副本。
+名单内任一在线成员都能复用原所有者目录，不要求另一名成员同时在线；只有本次请求中在线
+且属于冻结名单的玩家会被传送，名单外玩家始终被拒绝。实例退出时先以 staging 和原子
+替换方式回写世界，再删除临时运行目录；`session.lock` 不会进入持久副本。
 
 成功创建、启动和退出都会把过期时间延长 `solo_retention_days`，默认 10 天。Scheduler
 每天使用宿主机本地时区在 04:00 清理已过期且未运行的玩家世界；04:00 后启动时会补跑
@@ -369,9 +375,9 @@ POST /admin/v1/solo/sessions/<session-id>/destroy
 POST /admin/v1/system/shutdown
 ```
 
-Bridge 接口使用 `Authorization: Bearer <bridge.token>`。除通用
-`/bridge/v1/solo/sessions` 管理接口使用 JSON 外，Bridge POST 请求采用
-`application/x-www-form-urlencoded`，实例与待传送任务列表采用 TSV 文本：
+Bridge 接口使用 `Authorization: Bearer <bridge.token>`。Solo 会话的查询、创建和销毁
+管理接口保留 JSON；指定会话启动和其他 Bridge POST 请求采用
+`application/x-www-form-urlencoded`，实例、会话索引与待传送任务列表采用 TSV 文本：
 
 ```text
 POST /bridge/v1/ready
@@ -382,6 +388,7 @@ GET  /bridge/v1/players
 GET  /bridge/v1/definitions
 GET  /bridge/v1/games
 GET  /bridge/v1/solo/access
+GET  /bridge/v1/solo/session-index
 POST /bridge/v1/solo/<game-id>/launch
 POST /bridge/v1/solo/<game-id>/destroy
 GET  /bridge/v1/solo/sessions
@@ -407,6 +414,13 @@ POST /bridge/v1/transfers/result
 `base64(server-id)<TAB>instance-uuid<TAB>open|roster<TAB>comma-separated-uuid-list`。
 Velocity 应先匹配当前实例 UUID；`open` 允许任意玩家进入，`roster` 只允许最后一列的
 冻结名单进入。
+`GET /bridge/v1/solo/sessions` 保持返回完整 JSON 会话列表。
+`GET /bridge/v1/solo/session-index` 每行输出
+`base64(game-id)<TAB>base64(session-id)<TAB>owner-uuid<TAB>comma-separated-uuid-list`。
+`POST /bridge/v1/solo/sessions/<session-id>/start` 接收
+`players=<comma-separated-uuid-list>`，只启动指定的现有会话并只为请求名单中的在线成员
+创建传送任务。名单必须非空且全部属于该会话；会话不存在时返回 `404`，该接口绝不会
+创建新世界。管理 API 的同名启动接口不接收表单，继续使用完整会话名单并返回 JSON。
 `GET /bridge/v1/games` 在原有 12 列后追加 `solo`、Base64 编码的 `solo_mode`、Base64
 编码的 `solo_startup`、`solo_max_players` 和 `solo_retention_days`，共 17 列。
 

@@ -303,6 +303,8 @@ pub struct ServerDefinition {
   #[serde(default)]
   pub idle_timeout_seconds: Option<u64>,
   #[serde(default)]
+  pub operator_players: bool,
+  #[serde(default)]
   pub gamevoting: Option<GameVotingDefinition>,
   #[serde(default)]
   pub plugins: Vec<ArtifactDefinition>,
@@ -926,6 +928,19 @@ mod tests {
     assert_eq!(game.solo_startup, SoloStartup::OnDemand);
     assert_eq!(game.solo_max_players, 1);
     assert_eq!(game.solo_retention_days, 10);
+    assert!(!definition.operator_players);
+  }
+
+  #[test]
+  fn server_definition_parses_operator_players() {
+    let definition: ServerDefinition = serde_json::from_value(serde_json::json!({
+      "core": {"kind":"fabric","minecraft_version":"1.21.11","java":"21"},
+      "memory": {"initial_mib":1024,"maximum_mib":4096},
+      "operator_players": true
+    }))
+    .unwrap();
+    assert!(definition.validate().is_ok());
+    assert!(definition.operator_players);
   }
 
   #[test]
