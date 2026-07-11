@@ -220,12 +220,14 @@ pub async fn game_session_roots(game_root: &Path) -> Result<Vec<PathBuf>, SoloEr
 }
 
 pub async fn destroy_storage(persistence: &SoloPersistence) -> Result<(), SoloError> {
-  fs::remove_dir_all(&persistence.root)
-    .await
-    .map_err(|source| SoloError::Io {
+  match fs::remove_dir_all(&persistence.root).await {
+    Ok(()) => Ok(()),
+    Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+    Err(source) => Err(SoloError::Io {
       path: persistence.root.clone(),
       source,
-    })
+    }),
+  }
 }
 
 async fn copy_tree(source: &Path, target: &Path) -> Result<(), SoloError> {

@@ -468,6 +468,10 @@ pub struct GameVotingDefinition {
   pub name: String,
   #[serde(default)]
   pub description: Vec<String>,
+  #[serde(default)]
+  pub rules: Vec<String>,
+  #[serde(default)]
+  pub aliases: Vec<String>,
   pub material: String,
   #[serde(default)]
   pub custom_model_data: u32,
@@ -500,6 +504,9 @@ impl GameVotingDefinition {
       return Err(ConfigError::Validation(
         "GameVoting name must not be empty".into(),
       ));
+    }
+    for alias in &self.aliases {
+      validate_id(alias)?;
     }
     if self.material.is_empty()
       || !self
@@ -912,6 +919,8 @@ mod tests {
         "id": "bedwar",
         "name": "BedWars",
         "description": ["Protect the bed"],
+        "rules": ["Destroy every enemy bed"],
+        "aliases": ["bedwars"],
         "material": "BLUE_BED",
         "min_version": "1.21.11",
         "max_version": "1.21.11",
@@ -923,6 +932,8 @@ mod tests {
     assert!(definition.validate().is_ok());
     let game = definition.gamevoting.unwrap();
     assert_eq!(game.max_players, 8);
+    assert_eq!(game.rules, ["Destroy every enemy bed"]);
+    assert_eq!(game.aliases, ["bedwars"]);
     assert!(!game.solo);
     assert_eq!(game.solo_mode, SoloMode::Shared);
     assert_eq!(game.solo_startup, SoloStartup::OnDemand);

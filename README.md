@@ -171,6 +171,13 @@ API 使用的服务器 ID。
     "description": [
       "&7Example description"
     ],
+    "rules": [
+      "First rule",
+      "Second rule"
+    ],
+    "aliases": [
+      "example-game"
+    ],
     "material": "DIAMOND_SWORD",
     "custom_model_data": 0,
     "min_version": "1.21.11",
@@ -230,8 +237,8 @@ API 使用的服务器 ID。
 
 可投票子服通过可选的 `gamevoting` 节点进入 Scheduler 游戏目录。`order` 控制菜单顺序，
 `id` 是投票命令使用的游戏 ID，启动用的服务器 ID 直接取当前 JSON 文件名；显示文本、
-图标、客户端版本范围和人数范围都只在此处维护。Scheduler 会拒绝重复游戏 ID、非法
-材质标识以及无效人数范围。
+规则、别名、图标、客户端版本范围和人数范围都只在此处维护。Scheduler 会拒绝重复游戏
+ID、非法别名、非法材质标识以及无效人数范围。
 
 `render_files` 中列出的文本文件会在实例准备阶段替换以下变量：
 
@@ -311,6 +318,10 @@ Velocity 在线状态把玩家 UUID 解析为合法用户名，并先向目标�
 每天使用宿主机本地时区在 04:00 清理已过期且未运行的玩家世界；04:00 后启动时会补跑
 当天清理，运行中的世界不会被删除。
 
+玩家主动销毁时，Scheduler 会先等待运行实例完整停服并回写，再删除持久目录和会话。
+销毁任务独立于 HTTP 客户端连接存活，重复请求和目录已经不存在均按成功处理，避免网络
+超时后留下不可重试的半完成状态。
+
 ## CLI
 
 启动 Scheduler 后台进程：
@@ -387,6 +398,7 @@ POST /bridge/v1/players
 GET  /bridge/v1/players
 GET  /bridge/v1/definitions
 GET  /bridge/v1/games
+GET  /bridge/v1/games/details
 GET  /bridge/v1/solo/access
 GET  /bridge/v1/solo/session-index
 POST /bridge/v1/solo/<game-id>/launch
@@ -410,7 +422,7 @@ POST /bridge/v1/transfers/result
 `players=<comma-separated-uuid-list>`。`owner` 必须包含在 `players` 中，所有玩家必须
 当前连接到 Velocity。返回值与普通启动接口相同，为 5 列实例 TSV。
 `POST /bridge/v1/solo/<game-id>/destroy` 接收 `player=<uuid>`，只用于销毁
-`player_world`。`GET /bridge/v1/solo/access` 每行输出
+`player_world`；重复调用保持幂等。`GET /bridge/v1/solo/access` 每行输出
 `base64(server-id)<TAB>instance-uuid<TAB>open|roster<TAB>comma-separated-uuid-list`。
 Velocity 应先匹配当前实例 UUID；`open` 允许任意玩家进入，`roster` 只允许最后一列的
 冻结名单进入。
@@ -423,6 +435,9 @@ Velocity 应先匹配当前实例 UUID；`open` 允许任意玩家进入，`rost
 创建新世界。管理 API 的同名启动接口不接收表单，继续使用完整会话名单并返回 JSON。
 `GET /bridge/v1/games` 在原有 12 列后追加 `solo`、Base64 编码的 `solo_mode`、Base64
 编码的 `solo_startup`、`solo_max_players` 和 `solo_retention_days`，共 17 列。
+`GET /bridge/v1/games/details` 保持前 17 列一致，并追加以 `U+001F` 连接后 Base64 编码
+的 `rules` 和 `aliases`，共 19 列，供 Velocity `/game` 显示完整介绍与规则。旧 Bridge
+继续使用 17 列接口，不受详细目录扩展影响。
 
 传送失败后，Scheduler 会按照 `bridge.transfer_retry_seconds` 重新提供任务，但只在
 `bridge.transfer_timeout_seconds` 内且不超过 `bridge.transfer_max_attempts`。玩家已经

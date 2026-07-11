@@ -703,13 +703,10 @@ impl InstanceManager {
     session_id: &str,
   ) -> Result<Option<InstanceInfo>, ManagerError> {
     let _operations = self.solo_operations.lock().await;
-    let record = self
-      .solo_sessions
-      .read()
-      .await
-      .get(session_id)
-      .cloned()
-      .ok_or_else(|| ManagerError::NotFound(session_id.to_string()))?;
+    let record = self.solo_sessions.read().await.get(session_id).cloned();
+    let Some(record) = record else {
+      return Ok(None);
+    };
     let instance = self.instances.read().await.get(&record.backend_id).cloned();
     let stopped = if let Some(instance) = instance {
       if instance.info.read().await.state.active() {
@@ -744,9 +741,11 @@ impl InstanceManager {
       .await
       .values()
       .find(|session| session.game_id == game_id && session.players.contains(&player))
-      .map(|session| session.session_id.clone())
-      .ok_or_else(|| ManagerError::NotFound(format!("{game_id}:{player}")))?;
-    self.destroy_solo_session(&session_id).await
+      .map(|session| session.session_id.clone());
+    match session_id {
+      Some(session_id) => self.destroy_solo_session(&session_id).await,
+      None => Ok(None),
+    }
   }
 
   pub async fn solo_access(&self) -> Result<Vec<SoloAccessEntry>, ManagerError> {
@@ -2776,6 +2775,54 @@ mod tests {
       .unwrap();
     assert_eq!(rebuilt.owner, second);
     assert_ne!(rebuilt.session_id, created.session_id);
+  }
+
+  #[tokio::test]
+  async fn player_world_destroy_removes_storage_and_is_idempotent() {
+    let (directory, manager) =
+      solo_test_manager(SoloMode::PlayerWorld, SoloStartup::OnDemand).await;
+    let owner = Uuid::new_v4();
+    let teammate = Uuid::new_v4();
+    manager
+      .replace_players(vec![presence(owner), presence(teammate)])
+      .await;
+    let session = manager
+      .create_solo_session(SoloSessionCreateRequest {
+        game_id: "puzzle".into(),
+        owner,
+        players: vec![owner, teammate],
+      })
+      .await
+      .unwrap();
+    let storage = directory
+      .path()
+      .join("worlds/puzzle")
+      .join(owner.to_string());
+    assert!(storage.is_dir());
+
+    assert!(
+      manager
+        .destroy_solo_for_player("puzzle", teammate)
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(!storage.exists());
+    assert!(manager.solo_sessions().await.is_empty());
+    assert!(
+      manager
+        .destroy_solo_for_player("puzzle", owner)
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+      manager
+        .destroy_solo_session(&session.session_id)
+        .await
+        .unwrap()
+        .is_none()
+    );
   }
 
   #[tokio::test]

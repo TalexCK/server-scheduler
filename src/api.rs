@@ -73,6 +73,7 @@ pub fn router(state: ApiState) -> Router {
     )
     .route("/definitions", get(bridge_definitions))
     .route("/games", get(bridge_games))
+    .route("/games/details", get(bridge_game_details))
     .route("/solo/access", get(bridge_solo_access))
     .route("/solo/{game_id}/launch", post(bridge_solo_launch))
     .route("/solo/{game_id}/destroy", post(bridge_solo_destroy))
@@ -230,7 +231,16 @@ async fn destroy_solo_session(
   State(state): State<ApiState>,
   Path(session_id): Path<String>,
 ) -> Result<Json<Option<crate::protocol::InstanceInfo>>, ApiError> {
-  Ok(Json(state.manager.destroy_solo_session(&session_id).await?))
+  let manager = state.manager.clone();
+  let result = tokio::spawn(async move { manager.destroy_solo_session(&session_id).await })
+    .await
+    .map_err(|error| {
+      ApiError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("solo destruction task failed: {error}"),
+      )
+    })??;
+  Ok(Json(result))
 }
 
 async fn shutdown(State(state): State<ApiState>) -> StatusCode {
@@ -321,6 +331,21 @@ async fn bridge_games(State(state): State<ApiState>) -> Result<String, ApiError>
     games
       .into_iter()
       .map(|(server_id, game)| format_game_catalog_entry(&server_id, &game))
+      .collect(),
+  )
+}
+
+async fn bridge_game_details(State(state): State<ApiState>) -> Result<String, ApiError> {
+  let games = state
+    .config
+    .game_definitions()
+    .await
+    .map_err(crate::layout::LayoutError::from)
+    .map_err(ManagerError::from)?;
+  Ok(
+    games
+      .into_iter()
+      .map(|(server_id, game)| format_game_details_entry(&server_id, &game))
       .collect(),
   )
 }
@@ -434,10 +459,15 @@ async fn bridge_solo_destroy(
   Path(game_id): Path<String>,
   Form(form): Form<SoloDestroyForm>,
 ) -> Result<StatusCode, ApiError> {
-  state
-    .manager
-    .destroy_solo_for_player(&game_id, form.player)
-    .await?;
+  let manager = state.manager.clone();
+  tokio::spawn(async move { manager.destroy_solo_for_player(&game_id, form.player).await })
+    .await
+    .map_err(|error| {
+      ApiError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("solo destruction task failed: {error}"),
+      )
+    })??;
   Ok(StatusCode::NO_CONTENT)
 }
 
@@ -464,6 +494,34 @@ fn format_game_catalog_entry(
     encode_game_field(game.solo_startup.as_str()),
     game.solo_max_players,
     game.solo_retention_days
+  )
+}
+
+fn format_game_details_entry(
+  server_id: &str,
+  game: &crate::config::GameVotingDefinition,
+) -> String {
+  format!(
+    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+    game.order,
+    encode_game_field(&game.id),
+    encode_game_field(server_id),
+    encode_game_field(&game.name),
+    encode_game_field(&game.description.join("\u{1f}")),
+    encode_game_field(&game.material),
+    game.custom_model_data,
+    encode_game_field(game.version.as_deref().unwrap_or_default()),
+    encode_game_field(game.min_version.as_deref().unwrap_or_default()),
+    encode_game_field(game.max_version.as_deref().unwrap_or_default()),
+    game.min_players,
+    game.max_players,
+    game.solo,
+    encode_game_field(game.solo_mode.as_str()),
+    encode_game_field(game.solo_startup.as_str()),
+    game.solo_max_players,
+    game.solo_retention_days,
+    encode_game_field(&game.rules.join("\u{1f}")),
+    encode_game_field(&game.aliases.join("\u{1f}"))
   )
 }
 
@@ -745,6 +803,30 @@ mod tests {
     assert_eq!(STANDARD_NO_PAD.decode(fields[13]).unwrap(), b"player_world");
     assert_eq!(STANDARD_NO_PAD.decode(fields[14]).unwrap(), b"on_demand");
     assert_eq!(&fields[15..], ["2", "10"]);
+  }
+
+  #[test]
+  fn detailed_game_catalog_includes_rules_and_aliases() {
+    let game = serde_json::from_value(serde_json::json!({
+      "id": "bedwar",
+      "name": "BedWars",
+      "description": ["Protect the bed"],
+      "rules": ["Destroy enemy beds", "Eliminate every team"],
+      "aliases": ["bedwars", "bw"],
+      "material": "BLUE_BED"
+    }))
+    .unwrap();
+    let line = format_game_details_entry("bedwar-server", &game);
+    let fields = line.trim_end_matches('\n').split('\t').collect::<Vec<_>>();
+    assert_eq!(fields.len(), 19);
+    assert_eq!(
+      STANDARD_NO_PAD.decode(fields[17]).unwrap(),
+      b"Destroy enemy beds\x1fEliminate every team"
+    );
+    assert_eq!(
+      STANDARD_NO_PAD.decode(fields[18]).unwrap(),
+      b"bedwars\x1fbw"
+    );
   }
 
   #[test]
