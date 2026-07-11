@@ -30,9 +30,7 @@ impl FrpcService {
     }
     let network_dir = config.resolve(&config.value.paths.network);
     let core = network_dir.join(&config.value.frpc_core);
-    let config_file = network_dir.join("frpc.toml");
     ensure_file(&core, "FRPC core").await?;
-    ensure_file(&config_file, "FRPC configuration").await?;
     let child = spawn(&core, &network_dir)?;
     let pid = child.id();
     let (stop, receiver) = oneshot::channel();
@@ -74,8 +72,6 @@ async fn ensure_file(path: &Path, label: &'static str) -> Result<(), NetworkErro
 fn spawn(core: &Path, network_dir: &Path) -> Result<Child, NetworkError> {
   Command::new(core)
     .current_dir(network_dir)
-    .arg("-c")
-    .arg("./frpc.toml")
     .stdin(Stdio::null())
     .stdout(Stdio::inherit())
     .stderr(Stdio::inherit())
@@ -156,7 +152,7 @@ mod tests {
     fs::create_dir_all(root.join("network")).await.unwrap();
     fs::write(
       root.join("network/frpc"),
-      b"#!/bin/sh\nwhile :; do sleep 1; done\n",
+      b"#!/bin/sh\nprintf '%s\\n' \"$#\" > frpc.args\npwd > frpc.cwd\nwhile :; do sleep 1; done\n",
     )
     .await
     .unwrap();
@@ -165,9 +161,6 @@ mod tests {
       .permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(root.join("network/frpc"), permissions).unwrap();
-    fs::write(root.join("network/frpc.toml"), b"serverAddr = \"test\"\n")
-      .await
-      .unwrap();
     fs::write(
       root.join("config.json"),
       serde_json::to_vec(&serde_json::json!({
@@ -186,6 +179,26 @@ mod tests {
     .unwrap();
     let config = Arc::new(LoadedConfig::load(root.join("config.json")).await.unwrap());
     let service = FrpcService::start(config).await.unwrap().unwrap();
+    let arguments = timeout(Duration::from_secs(5), async {
+      loop {
+        if let Ok(arguments) = fs::read_to_string(root.join("network/frpc.args")).await {
+          break arguments;
+        }
+        sleep(Duration::from_millis(10)).await;
+      }
+    })
+    .await
+    .unwrap();
+    let working_directory = fs::read_to_string(root.join("network/frpc.cwd"))
+      .await
+      .unwrap();
+    let expected_working_directory = root.join("network").canonicalize().unwrap();
+    assert_eq!(arguments.trim(), "0");
+    assert_eq!(
+      working_directory.trim(),
+      expected_working_directory.to_str().unwrap()
+    );
+    assert!(!root.join("network/frpc.toml").exists());
     timeout(Duration::from_secs(5), service.stop())
       .await
       .unwrap();
