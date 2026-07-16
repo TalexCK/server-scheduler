@@ -47,6 +47,11 @@ cargo build --release --locked
     "username": "minigames",
     "password": "replace-with-a-strong-password"
   },
+  "public-database": {
+    "enabled": false,
+    "url": "postgresql://scheduler:password@public-db.example.com:5432/scheduler_web?sslmode=require",
+    "publish_interval_seconds": 5
+  },
   "ports": {
     "velocity": 25565,
     "start": 50001,
@@ -77,6 +82,24 @@ cargo build --release --locked
 
 `api.token` 与 `bridge.token` 都必须至少包含 32 个字符。PostgreSQL 主目录、连接
 参数以及 Java 21、Java 25 的 Home 均由此文件统一配置。
+
+`public-database.enabled` 默认为 `false`。启用后必须提供公网 PostgreSQL URL；Scheduler
+会在启动时建表，并按 `publish_interval_seconds` 将服务器定义、运行实例和玩家位置作为
+一个事务快照发布。连接或初次发布失败时 Scheduler 会拒绝启动，避免 Web 长期展示过期
+数据；运行期间的短暂同步失败会记录错误并在下一周期重试。Scheduler 停止时会清空实例
+和在线玩家表，但保留服务器目录与排行榜数据。
+
+Scheduler 与 `scheduler-web` 不直接调用彼此的 HTTP API，唯一共享边界是以下四张表：
+
+- `scheduler_server_definitions`：可配置服务器及公开游戏目录信息。
+- `scheduler_server_instances`：当前启动的实例、状态、端口、心跳和在线人数。
+- `scheduler_players`：当前在线玩家、延迟及所在服务器。
+- `scheduler_leaderboard_entries`：结构化排行榜读模型。Bingo Stats Mod 通过受 Bridge
+  Token 保护的 `POST /bridge/v1/leaderboards` 提交月榜与总榜完成用时，Scheduler
+  校验后写入；Web 只读此表。Bingo 的 `score` 单位为毫秒，数值越小排名越高。
+
+公网数据库账号应只授予这四张表及其索引所需权限。Web 后端应使用单独的只读账号，
+并通过环境变量注入连接 URL，不应复用 Scheduler 的写入账号。
 
 Velocity 使用 `ports.velocity` 的固定入口端口。普通子服务器从 `ports.start` 开始
 选择第一个未被当前 Scheduler 实例、宿主机其他进程或端口复用冷却占用的端口。子服
@@ -272,10 +295,14 @@ Scheduler 自动向子进程注入：
 ```text
 SCHEDULER_BRIDGE_URL
 SCHEDULER_BRIDGE_TOKEN
+SCHEDULER_LEADERBOARD_ENABLED
 SCHEDULER_SERVER_ID
 SCHEDULER_INSTANCE_ID
 SCHEDULER_SERVER_PORT
 ```
+
+`SCHEDULER_LEADERBOARD_ENABLED` 与 `public-database.enabled` 保持一致。值为 `false`
+时，游戏统计模组不得向排行榜 Bridge API 提交数据。
 
 实例启动后保持 `Starting` 状态。游戏服 Bridge 上报 READY 后切换为 `Ready`，随后
 才会创建待执行的玩家传送任务。Bridge 每 10 秒发送心跳；超过配置的启动或心跳

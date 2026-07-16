@@ -17,9 +17,10 @@ use crate::{
   config::LoadedConfig,
   manager::{InstanceManager, ManagerError},
   protocol::{
-    CommandRequest, CommandResponse, HeartbeatForm, IdleForm, LaunchRequest, LogResponse,
-    PlayerListForm, PlayerPresence, PlayersForm, ReadyForm, SoloDestroyForm, SoloLaunchForm,
-    SoloSessionCreateRequest, SoloSessionInfo, TransferResultForm,
+    CommandRequest, CommandResponse, HeartbeatForm, IdleForm, LaunchRequest,
+    LeaderboardEntryRequest, LeaderboardPeriod, LogResponse, PlayerListForm, PlayerPresence,
+    PlayersForm, ReadyForm, SoloDestroyForm, SoloLaunchForm, SoloSessionCreateRequest,
+    SoloSessionInfo, TransferResultForm,
   },
 };
 
@@ -28,6 +29,7 @@ pub struct ApiState {
   pub config: Arc<LoadedConfig>,
   pub manager: InstanceManager,
   pub shutdown: broadcast::Sender<()>,
+  pub public_database: Option<crate::public_database::PublicDatabase>,
 }
 
 #[derive(Clone)]
@@ -102,6 +104,7 @@ pub fn router(state: ApiState) -> Router {
     .route("/servers/{server_id}/command", post(bridge_command))
     .route("/transfers", get(pending_transfers))
     .route("/transfers/result", post(transfer_result))
+    .route("/leaderboards", post(bridge_upsert_leaderboard))
     .route_layer(middleware::from_fn_with_state(
       AuthState {
         token: Arc::from(state.config.value.bridge.token.clone()),
@@ -114,6 +117,84 @@ pub fn router(state: ApiState) -> Router {
     .nest("/admin/v1", admin)
     .nest("/bridge/v1", bridge)
     .with_state(state)
+}
+
+async fn bridge_upsert_leaderboard(
+  State(state): State<ApiState>,
+  Json(mut entry): Json<LeaderboardEntryRequest>,
+) -> Result<StatusCode, ApiError> {
+  validate_leaderboard_entry(&mut entry)?;
+  let database = state.public_database.as_ref().ok_or_else(|| {
+    ApiError::new(
+      StatusCode::SERVICE_UNAVAILABLE,
+      "public database publication is disabled",
+    )
+  })?;
+  database
+    .upsert_leaderboard_entry(&entry)
+    .await
+    .map_err(|error| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+  Ok(StatusCode::NO_CONTENT)
+}
+
+fn validate_leaderboard_entry(entry: &mut LeaderboardEntryRequest) -> Result<(), ApiError> {
+  entry.game = entry.game.trim().to_ascii_lowercase();
+  entry.metric = entry.metric.trim().to_ascii_lowercase();
+  entry.player_id = entry.player_id.trim().to_owned();
+  entry.username = entry.username.trim().to_owned();
+  if entry.game != "bingo" {
+    return Err(ApiError::new(StatusCode::BAD_REQUEST, "game must be bingo"));
+  }
+  if !valid_identifier(&entry.metric, 64) {
+    return Err(ApiError::new(
+      StatusCode::BAD_REQUEST,
+      "metric must be a lowercase identifier",
+    ));
+  }
+  if entry.player_id.is_empty() || entry.player_id.len() > 64 {
+    return Err(ApiError::new(StatusCode::BAD_REQUEST, "invalid player_id"));
+  }
+  if entry.username.is_empty() || entry.username.len() > 64 {
+    return Err(ApiError::new(StatusCode::BAD_REQUEST, "invalid username"));
+  }
+  if entry.score <= 0 {
+    return Err(ApiError::new(
+      StatusCode::BAD_REQUEST,
+      "score must be a positive duration in milliseconds",
+    ));
+  }
+  match entry.period {
+    LeaderboardPeriod::Month => {
+      let key = entry.period_key.as_deref().unwrap_or_default();
+      if !valid_month_key(key) {
+        return Err(ApiError::new(
+          StatusCode::BAD_REQUEST,
+          "month period_key must use YYYY-MM",
+        ));
+      }
+    }
+    LeaderboardPeriod::AllTime => entry.period_key = None,
+  }
+  Ok(())
+}
+
+fn valid_identifier(value: &str, max_len: usize) -> bool {
+  !value.is_empty()
+    && value.len() <= max_len
+    && value
+      .bytes()
+      .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn valid_month_key(value: &str) -> bool {
+  let Some((year, month)) = value.split_once('-') else {
+    return false;
+  };
+  year.len() == 4
+    && year.bytes().all(|byte| byte.is_ascii_digit())
+    && month.len() == 2
+    && month.bytes().all(|byte| byte.is_ascii_digit())
+    && matches!(month.parse::<u8>(), Ok(1..=12))
 }
 
 async fn require_token(
@@ -781,6 +862,37 @@ mod tests {
     let mut headers = HeaderMap::new();
     headers.insert(AUTHORIZATION, "Basic test".parse().unwrap());
     assert!(!valid_bearer(&headers, "01234567890123456789012345678901"));
+  }
+
+  #[test]
+  fn leaderboard_validation_normalizes_all_time_and_rejects_non_positive_duration() {
+    let mut entry = LeaderboardEntryRequest {
+      game: " Bingo ".into(),
+      metric: "NORMAL".into(),
+      period: LeaderboardPeriod::AllTime,
+      period_key: Some("2026-07".into()),
+      player_id: " player-one ".into(),
+      username: " Alex ".into(),
+      player_uuid: uuid::Uuid::nil(),
+      score: 42,
+      updated_at: chrono::Utc::now(),
+    };
+    validate_leaderboard_entry(&mut entry).unwrap();
+    assert_eq!(entry.game, "bingo");
+    assert_eq!(entry.metric, "normal");
+    assert_eq!(entry.period_key, None);
+    assert_eq!(entry.player_id, "player-one");
+
+    entry.score = 0;
+    assert!(validate_leaderboard_entry(&mut entry).is_err());
+  }
+
+  #[test]
+  fn leaderboard_month_requires_calendar_month_key() {
+    assert!(valid_month_key("2026-07"));
+    assert!(!valid_month_key("2026-00"));
+    assert!(!valid_month_key("2026-13"));
+    assert!(!valid_month_key("26-07"));
   }
 
   #[test]

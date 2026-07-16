@@ -2048,6 +2048,10 @@ fn create_process_command(config: &LoadedConfig, prepared: &PreparedInstance) ->
       format!("http://127.0.0.1:{}", config.value.api.port),
     )
     .env("SCHEDULER_BRIDGE_TOKEN", &config.value.bridge.token)
+    .env(
+      "SCHEDULER_LEADERBOARD_ENABLED",
+      config.value.public_database.enabled.to_string(),
+    )
     .env("SCHEDULER_SERVER_ID", &prepared.server_id)
     .env("SCHEDULER_INSTANCE_ID", prepared.instance_id.to_string())
     .env("SCHEDULER_SERVER_PORT", prepared.port.to_string())
@@ -3914,6 +3918,9 @@ mod tests {
     let prepared = layout::prepare(&config, "game", port).await.unwrap();
     let log_buffer = open_instance_log(&prepared).await.unwrap();
     let mut command = create_process_command(&config, &prepared);
+    assert!(command.as_std().get_envs().any(|(key, value)| {
+      key == "SCHEDULER_LEADERBOARD_ENABLED" && value == Some(std::ffi::OsStr::new("false"))
+    }));
     let mut child = spawn_instance_process(&mut command, &prepared)
       .await
       .unwrap();

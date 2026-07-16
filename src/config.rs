@@ -22,6 +22,8 @@ pub struct SchedulerConfig {
   pub api: ApiConfig,
   pub bridge: BridgeConfig,
   pub postgresql: PostgresConfig,
+  #[serde(default, rename = "public-database")]
+  pub public_database: PublicDatabaseConfig,
   pub ports: PortConfig,
   #[serde(default, rename = "enable-frpc")]
   pub enable_frpc: bool,
@@ -57,6 +59,26 @@ pub struct PostgresConfig {
   pub port: u16,
   pub username: String,
   pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicDatabaseConfig {
+  #[serde(default)]
+  pub enabled: bool,
+  #[serde(default)]
+  pub url: String,
+  #[serde(default = "default_public_database_publish_interval")]
+  pub publish_interval_seconds: u64,
+}
+
+impl Default for PublicDatabaseConfig {
+  fn default() -> Self {
+    Self {
+      enabled: false,
+      url: String::new(),
+      publish_interval_seconds: default_public_database_publish_interval(),
+    }
+  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +292,20 @@ impl SchedulerConfig {
         "PostgreSQL password contains invalid characters".into(),
       ));
     }
+    if self.public_database.enabled {
+      if !self.public_database.url.starts_with("postgres://")
+        && !self.public_database.url.starts_with("postgresql://")
+      {
+        return Err(ConfigError::Validation(
+          "enabled public database requires a postgres:// or postgresql:// URL".into(),
+        ));
+      }
+      if self.public_database.publish_interval_seconds == 0 {
+        return Err(ConfigError::Validation(
+          "public database publish_interval_seconds must be greater than zero".into(),
+        ));
+      }
+    }
     if self.ports.velocity == 0 || self.ports.start == 0 || self.ports.end < self.ports.start {
       return Err(ConfigError::Validation(
         "server port allocation range is invalid".into(),
@@ -288,6 +324,10 @@ impl SchedulerConfig {
     validate_relative_path(&self.frpc_core)?;
     Ok(())
   }
+}
+
+fn default_public_database_publish_interval() -> u64 {
+  5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -820,6 +860,26 @@ fn default_solo_retention_days() -> u32 {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn public_database_is_disabled_by_default() {
+    let config: PublicDatabaseConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+    assert!(!config.enabled);
+    assert!(config.url.is_empty());
+    assert_eq!(config.publish_interval_seconds, 5);
+  }
+
+  #[test]
+  fn public_database_parses_explicit_settings() {
+    let config: PublicDatabaseConfig = serde_json::from_value(serde_json::json!({
+      "enabled": true,
+      "url": "postgresql://scheduler:secret@db.example.com/scheduler",
+      "publish_interval_seconds": 15
+    }))
+    .unwrap();
+    assert!(config.enabled);
+    assert_eq!(config.publish_interval_seconds, 15);
+  }
 
   #[test]
   fn identifiers_reject_path_segments() {

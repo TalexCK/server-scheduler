@@ -6,6 +6,7 @@ mod layout;
 mod manager;
 mod network;
 mod protocol;
+mod public_database;
 mod runtime;
 mod solo;
 
@@ -130,14 +131,25 @@ async fn run_daemon(config: Arc<LoadedConfig>) -> Result<(), Box<dyn std::error:
   runtime::clear_staging(&runtime_root).await?;
   let manager = InstanceManager::new(config.clone());
   manager.initialize().await?;
+  let public_database = public_database::PublicDatabase::connect(&config).await?;
+  if let Some(database) = &public_database {
+    database.publish(&config, &manager).await?;
+  }
   let frpc = network::FrpcService::start(config.clone()).await?;
   let monitor = manager.clone();
   tokio::spawn(async move { monitor.monitor().await });
   let (shutdown, mut shutdown_receiver) = broadcast::channel(4);
+  let publisher = public_database.clone().map(|database| {
+    let config = config.clone();
+    let manager = manager.clone();
+    let receiver = shutdown.subscribe();
+    tokio::spawn(async move { database.run(config, manager, receiver).await })
+  });
   let state = ApiState {
     config: config.clone(),
     manager: manager.clone(),
-    shutdown,
+    shutdown: shutdown.clone(),
+    public_database,
   };
   let listener = TcpListener::bind(("127.0.0.1", config.value.api.port)).await?;
   info!(address = %listener.local_addr()?, "scheduler daemon started");
@@ -149,7 +161,11 @@ async fn run_daemon(config: Arc<LoadedConfig>) -> Result<(), Box<dyn std::error:
       }
     })
     .await;
+  let _ = shutdown.send(());
   manager.stop_all().await;
+  if let Some(publisher) = publisher {
+    let _ = publisher.await;
+  }
   if let Some(frpc) = frpc {
     frpc.stop().await;
   }
