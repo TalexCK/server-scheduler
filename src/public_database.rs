@@ -70,6 +70,10 @@ const SCHEMA_STATEMENTS: [&str; 15] = [
   "CREATE INDEX IF NOT EXISTS scheduler_leaderboard_entries_catalog_idx ON scheduler_leaderboard_entries (game, metric, period, period_key) WHERE game IS NOT NULL",
 ];
 
+// 所有快照发布者共享同一把 PostgreSQL 事务锁，避免定时发布、手动同步或
+// 多个 Scheduler 进程同时执行 DELETE + INSERT 时产生交错快照和主键冲突。
+const SNAPSHOT_ADVISORY_LOCK_ID: i64 = 0x5343_4845_4455_4c45;
+
 #[derive(Clone)]
 pub struct PublicDatabase {
   pool: PgPool,
@@ -164,11 +168,13 @@ impl PublicDatabase {
     config: &LoadedConfig,
     manager: &InstanceManager,
   ) -> Result<(), PublicDatabaseError> {
+    let mut transaction = self.pool.begin().await?;
+    lock_snapshot_publication(&mut transaction).await?;
+
     let definitions = load_definitions(config).await?;
     let instances = manager.list().await;
     let players = manager.players().await;
     let player_counts = count_players(&players);
-    let mut transaction = self.pool.begin().await?;
 
     sqlx::query("DELETE FROM scheduler_server_definitions")
       .execute(&mut *transaction)
@@ -247,6 +253,7 @@ impl PublicDatabase {
 
   async fn clear_live_state(&self) -> Result<(), PublicDatabaseError> {
     let mut transaction = self.pool.begin().await?;
+    lock_snapshot_publication(&mut transaction).await?;
     sqlx::query("DELETE FROM scheduler_players")
       .execute(&mut *transaction)
       .await?;
@@ -256,6 +263,16 @@ impl PublicDatabase {
     transaction.commit().await?;
     Ok(())
   }
+}
+
+async fn lock_snapshot_publication(
+  transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), PublicDatabaseError> {
+  sqlx::query("SELECT pg_advisory_xact_lock($1)")
+    .bind(SNAPSHOT_ADVISORY_LOCK_ID)
+    .execute(&mut **transaction)
+    .await?;
+  Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
