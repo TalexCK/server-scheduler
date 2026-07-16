@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use axum::{
   Json, Router,
@@ -105,6 +105,7 @@ pub fn router(state: ApiState) -> Router {
     .route("/transfers", get(pending_transfers))
     .route("/transfers/result", post(transfer_result))
     .route("/leaderboards", post(bridge_upsert_leaderboard))
+    .route("/sync", post(bridge_sync))
     .route_layer(middleware::from_fn_with_state(
       AuthState {
         token: Arc::from(state.config.value.bridge.token.clone()),
@@ -135,6 +136,101 @@ async fn bridge_upsert_leaderboard(
     .await
     .map_err(|error| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
   Ok(StatusCode::NO_CONTENT)
+}
+
+const BINGO_SYNC_COMMAND: &str = "bingo_stats sync";
+
+async fn bridge_sync(State(state): State<ApiState>) -> Result<String, ApiError> {
+  let database = state.public_database.as_ref().ok_or_else(|| {
+    ApiError::new(
+      StatusCode::SERVICE_UNAVAILABLE,
+      "public database publication is disabled",
+    )
+  })?;
+  database
+    .publish(&state.config, &state.manager)
+    .await
+    .map_err(|error| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+
+  let bingo_server_ids = state
+    .config
+    .game_definitions()
+    .await
+    .map_err(crate::layout::LayoutError::from)
+    .map_err(ManagerError::from)?
+    .into_iter()
+    .filter(|(_, game)| game.id.eq_ignore_ascii_case("bingo"))
+    .map(|(server_id, _)| server_id)
+    .collect::<BTreeSet<_>>();
+  let bingo_backend_ids = state
+    .manager
+    .solo_sessions()
+    .await
+    .into_iter()
+    .filter(|session| session.game_id.eq_ignore_ascii_case("bingo"))
+    .map(|session| session.backend_id)
+    .collect::<BTreeSet<_>>();
+  let targets = ready_bingo_instances(
+    state.manager.list().await,
+    &bingo_server_ids,
+    &bingo_backend_ids,
+  );
+
+  let mut report = vec!["Public database snapshot published.".to_string()];
+  if targets.is_empty() {
+    report.push("No READY Bingo instances were available for leaderboard sync.".to_string());
+    return Ok(join_lines(report));
+  }
+
+  let mut submitted = 0usize;
+  let mut failed = 0usize;
+  for server_id in targets {
+    match state
+      .manager
+      .command(&server_id, BINGO_SYNC_COMMAND.to_string())
+      .await
+    {
+      Ok(output) if output.is_empty() => {
+        submitted += 1;
+        report.push(format!(
+          "{server_id}: sync command submitted; no output was captured."
+        ));
+      }
+      Ok(output) => {
+        submitted += 1;
+        report.push(format!("{server_id}: sync command submitted."));
+        report.extend(
+          output
+            .into_iter()
+            .map(|line| format!("{server_id}: {line}")),
+        );
+      }
+      Err(error) => {
+        failed += 1;
+        report.push(format!("{server_id}: sync command failed: {error}"));
+      }
+    }
+  }
+  report.push(format!(
+    "Bingo sync trigger summary: {submitted} submitted, {failed} failed."
+  ));
+  Ok(join_lines(report))
+}
+
+fn ready_bingo_instances(
+  instances: Vec<crate::protocol::InstanceInfo>,
+  bingo_server_ids: &BTreeSet<String>,
+  bingo_backend_ids: &BTreeSet<String>,
+) -> Vec<String> {
+  instances
+    .into_iter()
+    .filter(|instance| instance.state == crate::protocol::InstanceState::Ready)
+    .filter(|instance| {
+      bingo_server_ids.contains(&instance.server_id)
+        || bingo_backend_ids.contains(&instance.server_id)
+    })
+    .map(|instance| instance.server_id)
+    .collect()
 }
 
 fn validate_leaderboard_entry(entry: &mut LeaderboardEntryRequest) -> Result<(), ApiError> {
@@ -1004,5 +1100,40 @@ mod tests {
   fn rejects_invalid_player_snapshot() {
     let error = parse_players("invalid\tAlex\t42\tlobby").unwrap_err();
     assert_eq!(error.status, StatusCode::BAD_REQUEST);
+  }
+
+  #[test]
+  fn sync_targets_only_ready_bingo_instances() {
+    let bingo_servers = BTreeSet::from(["Bingo".to_string()]);
+    let bingo_backends = BTreeSet::from(["Bingo-solo-owner".to_string()]);
+    let instances = vec![
+      sync_instance("Bingo", crate::protocol::InstanceState::Ready),
+      sync_instance("Bingo-solo-owner", crate::protocol::InstanceState::Ready),
+      sync_instance("Bingo-starting", crate::protocol::InstanceState::Starting),
+      sync_instance("Lobby", crate::protocol::InstanceState::Ready),
+    ];
+
+    assert_eq!(
+      ready_bingo_instances(instances, &bingo_servers, &bingo_backends),
+      ["Bingo", "Bingo-solo-owner"]
+    );
+  }
+
+  fn sync_instance(
+    server_id: &str,
+    state: crate::protocol::InstanceState,
+  ) -> crate::protocol::InstanceInfo {
+    crate::protocol::InstanceInfo {
+      server_id: server_id.to_string(),
+      instance_id: uuid::Uuid::new_v4(),
+      state,
+      pid: 1,
+      port: 25565,
+      work_dir: std::path::PathBuf::new(),
+      log_file: std::path::PathBuf::new(),
+      started_at: 0,
+      last_heartbeat: None,
+      exit_code: None,
+    }
   }
 }

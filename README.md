@@ -98,6 +98,10 @@ Scheduler 与 `scheduler-web` 不直接调用彼此的 HTTP API，唯一共享�
   Token 保护的 `POST /bridge/v1/leaderboards` 提交月榜与总榜完成用时，Scheduler
   校验后写入；Web 只读此表。Bingo 的 `score` 单位为毫秒，数值越小排名越高。
 
+Velocity 管理员可以执行 `/network sync`。该命令调用受 Bridge Token 保护的
+`POST /bridge/v1/sync`：Scheduler 先立即发布服务器定义、实例和玩家完整快照，再向
+所有 READY Bingo 实例发送 `bingo_stats sync`，等待并逐实例汇报排行榜同步触发结果。
+
 公网数据库账号应只授予这四张表及其索引所需权限。Web 后端应使用单独的只读账号，
 并通过环境变量注入连接 URL，不应复用 Scheduler 的写入账号。
 
