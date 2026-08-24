@@ -9,10 +9,11 @@ mod protocol;
 mod public_database;
 mod runtime;
 mod solo;
+mod world_store;
 
 use std::{
   fs::{self, OpenOptions},
-  io,
+  io::{self, Write},
   path::{Path, PathBuf},
   process::Stdio,
   sync::Arc,
@@ -122,6 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_daemon(config: Arc<LoadedConfig>) -> Result<(), Box<dyn std::error::Error>> {
+  let _pid_guard = ensure_daemon_pid_claim(&config).await?;
   tracing_subscriber::fmt()
     .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
     .init();
@@ -162,14 +164,15 @@ async fn run_daemon(config: Arc<LoadedConfig>) -> Result<(), Box<dyn std::error:
     })
     .await;
   let _ = shutdown.send(());
-  manager.stop_all().await;
+  for (server_id, error) in manager.stop_all().await {
+    tracing::error!(%server_id, %error, "server failed to stop cleanly during shutdown");
+  }
   if let Some(publisher) = publisher {
     let _ = publisher.await;
   }
   if let Some(frpc) = frpc {
     frpc.stop().await;
   }
-  let _ = tokio::fs::remove_file(config.resolve(&config.value.paths.pid_file)).await;
   result?;
   Ok(())
 }
@@ -195,6 +198,7 @@ async fn start_background(config: &LoadedConfig) -> Result<(), Box<dyn std::erro
     .arg("--config")
     .arg(&config.file)
     .arg("daemon")
+    .env("SCHEDULER_PID_CLAIMED", "1")
     .current_dir(&config.root)
     .stdin(Stdio::null())
     .stdout(Stdio::from(stdout))
@@ -204,11 +208,20 @@ async fn start_background(config: &LoadedConfig) -> Result<(), Box<dyn std::erro
     use std::os::unix::process::CommandExt;
     command.process_group(0);
   }
-  let child = command.spawn()?;
-  fs::write(
-    config.resolve(&config.value.paths.pid_file),
-    format!("{}\n", child.id()),
-  )?;
+  let pid_path = config.resolve(&config.value.paths.pid_file);
+  let mut pid_file = claim_pid_file(&pid_path)?;
+  let mut child = match command.spawn() {
+    Ok(child) => child,
+    Err(error) => {
+      let _ = fs::remove_file(&pid_path);
+      return Err(error.into());
+    }
+  };
+  if let Err(error) = writeln!(pid_file, "{}", child.id()).and_then(|()| pid_file.sync_all()) {
+    let _ = child.kill();
+    let _ = fs::remove_file(&pid_path);
+    return Err(error.into());
+  }
   for _ in 0..100 {
     if client.healthy().await {
       println!("scheduler started with PID {}", child.id());
@@ -223,6 +236,102 @@ async fn start_background(config: &LoadedConfig) -> Result<(), Box<dyn std::erro
     )
     .into(),
   )
+}
+
+fn claim_pid_file(path: &Path) -> io::Result<fs::File> {
+  match OpenOptions::new().write(true).create_new(true).open(path) {
+    Ok(file) => Ok(file),
+    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+      let detail = if scheduler_pid_is_live(path)? {
+        "scheduler is already running or starting"
+      } else {
+        "stale PID file exists; confirm the old process has exited, then remove the file manually"
+      };
+      Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("{detail}: {}", path.display()),
+      ))
+    }
+    Err(error) => Err(error),
+  }
+}
+
+fn scheduler_pid_is_live(path: &Path) -> io::Result<bool> {
+  let content = fs::read_to_string(path)?;
+  let Ok(pid) = content.trim().parse::<u32>() else {
+    return Ok(true);
+  };
+  Ok(process_is_running(pid))
+}
+
+struct PidFileGuard {
+  path: PathBuf,
+  pid: u32,
+}
+
+impl Drop for PidFileGuard {
+  fn drop(&mut self) {
+    if fs::read_to_string(&self.path)
+      .ok()
+      .and_then(|value| value.trim().parse::<u32>().ok())
+      == Some(self.pid)
+    {
+      let _ = fs::remove_file(&self.path);
+    }
+  }
+}
+
+async fn ensure_daemon_pid_claim(config: &LoadedConfig) -> io::Result<PidFileGuard> {
+  let path = config.resolve(&config.value.paths.pid_file);
+  let current_pid = std::process::id();
+  if std::env::var_os("SCHEDULER_PID_CLAIMED").is_some() {
+    for _ in 0..500 {
+      if fs::read_to_string(&path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        == Some(current_pid)
+      {
+        return Ok(PidFileGuard {
+          path,
+          pid: current_pid,
+        });
+      }
+      sleep(Duration::from_millis(10)).await;
+    }
+    return Err(io::Error::new(
+      io::ErrorKind::TimedOut,
+      format!(
+        "parent process did not publish daemon PID at {}",
+        path.display()
+      ),
+    ));
+  }
+
+  let mut file = claim_pid_file(&path)?;
+  writeln!(file, "{current_pid}")?;
+  file.sync_all()?;
+  Ok(PidFileGuard {
+    path,
+    pid: current_pid,
+  })
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+  let Ok(pid) = i32::try_from(pid) else {
+    return false;
+  };
+  // SAFETY：kill(pid, 0) 不发送信号，只检查目标进程是否存在。
+  if unsafe { libc::kill(pid, 0) } == 0 {
+    return true;
+  }
+  io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_is_running(_pid: u32) -> bool {
+  // 缺少可移植的进程查询时，保留锁比启动第二个守护进程更安全。
+  true
 }
 
 async fn stop_scheduler(config: &LoadedConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -268,6 +377,13 @@ async fn clear_runtime_directory(runtime: &Path) -> io::Result<()> {
   while let Some(entry) = entries.next_entry().await? {
     let path = entry.path();
     if entry.file_type().await?.is_dir() {
+      if world_store::has_recovery_marker(&path).await? {
+        tracing::warn!(
+          path = %path.display(),
+          "preserving persistent world recovery directory"
+        );
+        continue;
+      }
       tokio::fs::remove_dir_all(path).await?;
     } else {
       tokio::fs::remove_file(path).await?;
@@ -300,6 +416,29 @@ mod tests {
     }
   }
 
+  #[test]
+  fn pid_claim_rejects_a_live_scheduler_process() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("scheduler.pid");
+    fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+
+    let error = claim_pid_file(&path).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+  }
+
+  #[test]
+  fn pid_claim_never_removes_an_existing_stale_file() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("scheduler.pid");
+    fs::write(&path, "stale\n").unwrap();
+
+    let error = claim_pid_file(&path).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(fs::read_to_string(path).unwrap(), "stale\n");
+  }
+
   #[tokio::test]
   async fn runtime_cleanup_removes_all_entries() {
     let root = tempfile::tempdir().unwrap();
@@ -325,5 +464,29 @@ mod tests {
         .unwrap()
         .is_none()
     );
+  }
+
+  #[tokio::test]
+  async fn runtime_cleanup_preserves_persistent_world_recovery() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("runtime");
+    let recovery = runtime.join("survival-instance");
+    tokio::fs::create_dir_all(recovery.join("world"))
+      .await
+      .unwrap();
+    tokio::fs::write(
+      recovery.join(world_store::RECOVERY_MARKER),
+      r#"{"id":"survival","paths":["world"]}"#,
+    )
+    .await
+    .unwrap();
+    tokio::fs::create_dir_all(runtime.join("temporary"))
+      .await
+      .unwrap();
+
+    clear_runtime_directory(&runtime).await.unwrap();
+
+    assert!(recovery.join("world").exists());
+    assert!(!runtime.join("temporary").exists());
   }
 }

@@ -423,6 +423,11 @@ impl ServerDefinition {
             "player_world solo_mode requires level-name to be world".into(),
           ));
         }
+        if matches!(self.world, WorldDefinition::Persistent { .. }) {
+          return Err(ConfigError::Validation(
+            "player_world solo_mode cannot use a persistent static world".into(),
+          ));
+        }
       }
     }
     for artifact in &self.plugins {
@@ -449,8 +454,25 @@ impl ServerDefinition {
         validate_relative_path(target)?;
       }
     }
-    if let WorldDefinition::Template { id } = &self.world {
-      validate_id(id)?;
+    match &self.world {
+      WorldDefinition::Template { id } => validate_id(id)?,
+      WorldDefinition::Persistent { id, paths } => {
+        validate_id(id)?;
+        validate_persistent_world_paths(paths)?;
+        let level_name = self
+          .properties
+          .get("level-name")
+          .map(String::as_str)
+          .unwrap_or("world");
+        let level_path = Path::new(level_name);
+        validate_relative_path(level_path)?;
+        if !paths.iter().any(|path| path == level_path) {
+          return Err(ConfigError::Validation(format!(
+            "persistent world paths must include level-name directory: {level_name}"
+          )));
+        }
+      }
+      WorldDefinition::Generated => {}
     }
     for layer in &self.files {
       validate_relative_path(&layer.source)?;
@@ -707,6 +729,56 @@ pub enum WorldDefinition {
   Template {
     id: String,
   },
+  Persistent {
+    id: String,
+    #[serde(default = "default_persistent_world_paths")]
+    paths: Vec<PathBuf>,
+  },
+}
+
+fn default_persistent_world_paths() -> Vec<PathBuf> {
+  ["world", "world_nether", "world_the_end"]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
+}
+
+fn validate_persistent_world_paths(paths: &[PathBuf]) -> Result<(), ConfigError> {
+  if paths.is_empty() {
+    return Err(ConfigError::Validation(
+      "persistent world paths must not be empty".into(),
+    ));
+  }
+  let mut normalized = BTreeSet::new();
+  for path in paths {
+    if path.as_os_str().is_empty() {
+      return Err(ConfigError::Validation(
+        "persistent world paths must not contain an empty path".into(),
+      ));
+    }
+    validate_relative_path(path)?;
+    let lowercase = PathBuf::from(path.to_string_lossy().to_ascii_lowercase());
+    if !normalized.insert(lowercase) {
+      return Err(ConfigError::Validation(format!(
+        "duplicate persistent world path: {}",
+        path.display()
+      )));
+    }
+  }
+  let normalized = normalized.into_iter().collect::<Vec<_>>();
+  for (index, path) in normalized.iter().enumerate() {
+    if normalized
+      .iter()
+      .enumerate()
+      .any(|(other_index, other)| index != other_index && path.starts_with(other))
+    {
+      return Err(ConfigError::Validation(format!(
+        "overlapping persistent world path: {}",
+        path.display()
+      )));
+    }
+  }
+  Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -905,6 +977,49 @@ mod tests {
   }
 
   #[test]
+  fn persistent_world_uses_standard_paths_by_default() {
+    let definition: ServerDefinition = serde_json::from_value(serde_json::json!({
+      "core": {"kind":"paper","minecraft_version":"1.21.11","java":"21"},
+      "memory": {"initial_mib":1024,"maximum_mib":4096},
+      "world": {"mode":"persistent","id":"survival"}
+    }))
+    .unwrap();
+    assert!(definition.validate().is_ok());
+    let WorldDefinition::Persistent { id, paths } = definition.world else {
+      panic!("expected persistent world");
+    };
+    assert_eq!(id, "survival");
+    assert_eq!(
+      paths,
+      ["world", "world_nether", "world_the_end"]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>()
+    );
+  }
+
+  #[test]
+  fn persistent_world_rejects_unsafe_or_overlapping_paths() {
+    for paths in [
+      serde_json::json!([]),
+      serde_json::json!([""]),
+      serde_json::json!(["../world"]),
+      serde_json::json!(["/world"]),
+      serde_json::json!(["world", "WORLD"]),
+      serde_json::json!(["world", "world/region"]),
+      serde_json::json!(["world_nether"]),
+    ] {
+      let definition: ServerDefinition = serde_json::from_value(serde_json::json!({
+        "core": {"kind":"paper","minecraft_version":"1.21.11","java":"21"},
+        "memory": {"initial_mib":1024,"maximum_mib":4096},
+        "world": {"mode":"persistent","id":"survival","paths":paths}
+      }))
+      .unwrap();
+      assert!(definition.validate().is_err(), "paths={paths}");
+    }
+  }
+
+  #[test]
   fn server_definition_rejects_aikar_marker_options() {
     for value in [
       "-Dusing.aikars.flags=https://invalid.example",
@@ -1053,6 +1168,15 @@ mod tests {
       .properties
       .insert("level-name".into(), "other".into());
     assert!(invalid_level.validate().is_err());
+
+    let mut invalid_world = serde_json::to_value(&invalid_level).unwrap();
+    invalid_world["properties"] = serde_json::json!({});
+    invalid_world["world"] = serde_json::json!({
+      "mode": "persistent",
+      "id": "puzzle"
+    });
+    let invalid_world: ServerDefinition = serde_json::from_value(invalid_world).unwrap();
+    assert!(invalid_world.validate().is_err());
   }
 
   fn value_pointer_mut<'a>(

@@ -257,6 +257,38 @@ API 使用的服务器 ID。
 
 - `generated`：不复制世界模板，由服务端生成新世界。
 - `template`：将 `worlds/<world-id>/` 的内容复制到临时实例。
+- `persistent`：启动时从 `worlds/<world-id>/` 装载世界包，进程退出后将运行期
+  存档安全写回。默认保存 `world`、`world_nether` 和 `world_the_end`。
+
+普通长期存档服可以这样配置：
+
+```json
+"world": {
+  "mode": "persistent",
+  "id": "survival"
+}
+```
+
+使用 Multiverse 等插件维护额外世界时，可以显式指定需要保存的相对目录：
+
+```json
+"world": {
+  "mode": "persistent",
+  "id": "survival",
+  "paths": [
+    "world",
+    "world_nether",
+    "world_the_end",
+    "dungeons"
+  ]
+}
+```
+
+`paths` 至少包含一项并且必须包含 `properties.level-name` 指定的主世界目录（默认
+`world`）；所有值只允许安全的相对路径，并且不能重复、大小写冲突或互相嵌套。
+首次启动前必须创建 `worlds/<world-id>/`，并把已有世界目录放在其中。
+同一个持久世界 ID 同时只能由一个实例占用，即使两个不同服务器定义引用了相同 ID，
+后启动的实例也会被拒绝。
 
 材质包 URL、SHA-1 和是否强制下载由当前服务器的 `properties.resource-pack`、
 `properties.resource-pack-sha1` 与 `properties.require-resource-pack` 配置，不放在全局
@@ -290,9 +322,29 @@ ${RESOURCE_PACK_SHA1}
 世界模板和文件层。Scheduler 写入 `eula.txt`、合并 `server.properties`，完成模板
 渲染后使用服务器定义选择的 Java 启动进程。
 
-进程退出后，Scheduler 先回收运行期新增的共享依赖，再立即删除该实例的整个临时工作
-目录。Scheduler 启动时也会清空 `.runtime/` 中的历史残留，完整控制台输出只保留在
-独立的 `logs/` 目录中。
+进程退出后，Scheduler 先保存 `persistent` 或 `player_world` 存档，再回收运行期新增的
+共享依赖，最后删除该实例的整个临时工作目录。普通 `generated` 和 `template` 实例仍不
+回写世界。Scheduler 启动时会清空 `.runtime/` 中的普通历史残留，完整控制台输出只
+保留在独立的 `logs/` 目录中。
+
+`persistent` 以整个 `worlds/<world-id>/` 作为一次提交：先把旧世界包复制到 staging，
+再用 runtime 中实际存在的配置目录替换对应旧目录，最后通过 backup 和 rename 更新正式
+世界包。未在 runtime 中生成的可选世界会保留上一次副本，`session.lock` 不会进入存档，
+任何符号链接或特殊文件都会使保存失败。这样不会出现主世界已经更新、下界却仍是旧版本
+的混合存档。
+
+实例准备时会在 persistent runtime 写入 `.scheduler-persistent-world.json` 恢复标记。
+只有世界成功写回后才移除该标记。如果保存失败或 Scheduler 进程意外中断，下次启动
+会保留对应 runtime，并拒绝再次启动同一世界 ID；管理员需要先检查并处理该恢复目录，
+避免从旧存档启动后再次覆盖。若提交恰好中断在正式目录与 backup 的切换窗口，下一次
+装载（管理员处理完 recovery runtime 后）会优先恢复唯一的 backup；候选状态无法唯一
+判定时会拒绝自动选择。该机制不承诺
+在操作系统崩溃、断电或存储设备未完成落盘时仍具有持久性，生产环境仍应定期异机备份。
+
+后台启动会通过 `scheduler.pid` 的原子创建和存活 PID 检查保证单实例运行。即使旧守护
+进程已经关闭 HTTP 监听、仍在等待大世界保存完成，新的 `start`/`restart` 也会被拒绝，
+不会出现两个 Scheduler 同时操作同一存档的情况。为避免并发启动竞态，Scheduler 不会
+自动删除 stale PID 文件；确认旧进程已经退出后，需要由管理员手动删除该文件。
 
 Scheduler 自动向子进程注入：
 

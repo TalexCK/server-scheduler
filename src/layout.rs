@@ -13,6 +13,7 @@ use crate::config::{
 };
 use crate::dependency_cache::{self, DependencySnapshot};
 use crate::solo::{self, SoloPersistence};
+use crate::world_store::{self, PersistentWorld};
 
 #[derive(Debug, Clone)]
 pub struct PreparedInstance {
@@ -26,6 +27,7 @@ pub struct PreparedInstance {
   pub log_file: PathBuf,
   pub environment: BTreeMap<String, String>,
   pub dependency_snapshot: DependencySnapshot,
+  pub persistent_world: Option<PersistentWorld>,
 }
 
 struct InstanceIdentity<'a> {
@@ -35,12 +37,23 @@ struct InstanceIdentity<'a> {
   port: u16,
 }
 
+#[cfg(test)]
 pub async fn prepare(
   config: &LoadedConfig,
   server_id: &str,
   port: u16,
 ) -> Result<PreparedInstance, LayoutError> {
-  prepare_instance(config, server_id, server_id, port, None).await
+  let definition = config.load_server(server_id).await?;
+  prepare_instance(config, server_id, server_id, port, definition, None).await
+}
+
+pub async fn prepare_with_definition(
+  config: &LoadedConfig,
+  server_id: &str,
+  port: u16,
+  definition: ServerDefinition,
+) -> Result<PreparedInstance, LayoutError> {
+  prepare_instance(config, server_id, server_id, port, definition, None).await
 }
 
 pub async fn prepare_solo(
@@ -50,7 +63,16 @@ pub async fn prepare_solo(
   port: u16,
   persistence: &SoloPersistence,
 ) -> Result<PreparedInstance, LayoutError> {
-  prepare_instance(config, definition_id, runtime_id, port, Some(persistence)).await
+  let definition = config.load_server(definition_id).await?;
+  prepare_instance(
+    config,
+    definition_id,
+    runtime_id,
+    port,
+    definition,
+    Some(persistence),
+  )
+  .await
 }
 
 async fn prepare_instance(
@@ -58,9 +80,9 @@ async fn prepare_instance(
   definition_id: &str,
   runtime_id: &str,
   port: u16,
+  definition: ServerDefinition,
   persistence: Option<&SoloPersistence>,
 ) -> Result<PreparedInstance, LayoutError> {
-  let definition = config.load_server(definition_id).await?;
   let instance_id = Uuid::new_v4();
   let runtime_root = config.resolve(&config.value.paths.runtime);
   let logs_root = config.resolve(&config.value.paths.logs);
@@ -112,6 +134,10 @@ async fn prepare_inner(
   logs_root: PathBuf,
   persistence: Option<&SoloPersistence>,
 ) -> Result<PreparedInstance, LayoutError> {
+  let persistent_world = persistence
+    .is_none()
+    .then(|| PersistentWorld::from_definition(config, &definition))
+    .flatten();
   let core_root = config
     .resolve(&config.value.paths.cores)
     .join(&definition.core.kind);
@@ -162,6 +188,10 @@ async fn prepare_inner(
 
   if let Some(persistence) = persistence {
     solo::materialize_world(persistence, &work_dir.join("world")).await?;
+  }
+  if let Some(persistent_world) = &persistent_world {
+    world_store::materialize(persistent_world, &work_dir).await?;
+    world_store::write_recovery_marker(persistent_world, &work_dir).await?;
   }
 
   write_properties(
@@ -228,6 +258,7 @@ async fn prepare_inner(
     )),
     environment,
     dependency_snapshot,
+    persistent_world,
   })
 }
 
@@ -754,6 +785,8 @@ pub enum LayoutError {
   Config(#[from] crate::config::ConfigError),
   #[error(transparent)]
   Solo(#[from] crate::solo::SoloError),
+  #[error(transparent)]
+  WorldStore(#[from] crate::world_store::WorldStoreError),
   #[error("failed to access {path}: {source}")]
   Io {
     path: PathBuf,

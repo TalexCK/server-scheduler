@@ -918,13 +918,15 @@ impl ApiError {
 impl From<ManagerError> for ApiError {
   fn from(error: ManagerError) -> Self {
     let status = match error {
-      ManagerError::AlreadyRunning(_) => StatusCode::CONFLICT,
+      ManagerError::AlreadyRunning(_)
+      | ManagerError::PersistentWorldInUse(_)
+      | ManagerError::PersistentWorldRecovery { .. } => StatusCode::CONFLICT,
       ManagerError::Solo(crate::solo::SoloError::AlreadyExists(_)) => StatusCode::CONFLICT,
       ManagerError::NotFound(_) | ManagerError::NotRunning(_) => StatusCode::NOT_FOUND,
       ManagerError::Layout(_)
       | ManagerError::State(_)
       | ManagerError::Solo(crate::solo::SoloError::MissingWorld(_))
-      | ManagerError::Solo(crate::solo::SoloError::InvalidWorld(_)) => StatusCode::BAD_REQUEST,
+      | ManagerError::Solo(crate::solo::SoloError::WorldStore(_)) => StatusCode::BAD_REQUEST,
       _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     tracing::error!(%error, "API request failed");
@@ -952,6 +954,12 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn process_completion_failures_are_internal_server_errors() {
+    let error = ApiError::from(ManagerError::Completion("disk write failed".into()));
+    assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+  }
 
   #[test]
   fn bearer_validation_rejects_wrong_scheme() {

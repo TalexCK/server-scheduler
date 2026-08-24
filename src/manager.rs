@@ -4,7 +4,7 @@ use std::{
   path::{Path, PathBuf},
   process::Stdio,
   sync::{
-    Arc,
+    Arc, Mutex as StdMutex,
     atomic::{AtomicBool, Ordering},
   },
   time::{Duration, SystemTime, UNIX_EPOCH},
@@ -35,6 +35,7 @@ use crate::{
   },
   runtime,
   solo::{self, SoloPersistence, SoloWorldMetadata},
+  world_store::{self, PersistentWorld},
 };
 
 const LOG_HISTORY_LIMIT: usize = 2000;
@@ -51,6 +52,7 @@ pub struct InstanceManager {
   allocated_ports: Arc<Mutex<HashSet<u16>>>,
   port_cooldowns: Arc<Mutex<HashMap<u16, Instant>>>,
   launching: Arc<Mutex<HashSet<String>>>,
+  persistent_worlds: Arc<StdMutex<HashSet<String>>>,
   dependency_cache_lock: Arc<Mutex<()>>,
   solo_sessions: Arc<RwLock<HashMap<String, SoloSessionRecord>>>,
   solo_operations: Arc<Mutex<()>>,
@@ -76,6 +78,38 @@ struct InstanceControl {
   solo_mode: Option<SoloMode>,
   solo_session_id: Arc<Mutex<Option<String>>>,
   preserve_solo_session: Arc<AtomicBool>,
+}
+
+struct PersistentWorldLease {
+  key: String,
+  reservations: Arc<StdMutex<HashSet<String>>>,
+}
+
+impl PersistentWorldLease {
+  fn acquire(
+    reservations: Arc<StdMutex<HashSet<String>>>,
+    persistent: &PersistentWorld,
+  ) -> Result<Self, ManagerError> {
+    let key = persistent.root.to_string_lossy().to_ascii_lowercase();
+    let mut locked = reservations
+      .lock()
+      .unwrap_or_else(|error| error.into_inner());
+    if !locked.insert(key.clone()) {
+      return Err(ManagerError::PersistentWorldInUse(persistent.id.clone()));
+    }
+    drop(locked);
+    Ok(Self { key, reservations })
+  }
+}
+
+impl Drop for PersistentWorldLease {
+  fn drop(&mut self) {
+    self
+      .reservations
+      .lock()
+      .unwrap_or_else(|error| error.into_inner())
+      .remove(&self.key);
+  }
 }
 
 enum ProcessControl {
@@ -271,6 +305,7 @@ impl InstanceManager {
       allocated_ports: Arc::new(Mutex::new(HashSet::new())),
       port_cooldowns: Arc::new(Mutex::new(HashMap::new())),
       launching: Arc::new(Mutex::new(HashSet::new())),
+      persistent_worlds: Arc::new(StdMutex::new(HashSet::new())),
       dependency_cache_lock: Arc::new(Mutex::new(())),
       solo_sessions: Arc::new(RwLock::new(HashMap::new())),
       solo_operations: Arc::new(Mutex::new(())),
@@ -1008,6 +1043,24 @@ impl InstanceManager {
       .load_server(&spec.definition_id)
       .await
       .map_err(layout::LayoutError::from)?;
+    let planned_persistent = spec
+      .persistence
+      .is_none()
+      .then(|| PersistentWorld::from_definition(&self.config, &definition))
+      .flatten();
+    let persistent_world_lease = if let Some(persistent) = &planned_persistent {
+      let lease = PersistentWorldLease::acquire(self.persistent_worlds.clone(), persistent)?;
+      if let Some(path) = world_store::pending_recovery(&self.config, &persistent.id).await? {
+        return Err(ManagerError::PersistentWorldRecovery {
+          world_id: persistent.id.clone(),
+          path,
+        });
+      }
+      world_store::recover(persistent).await?;
+      Some(lease)
+    } else {
+      None
+    };
     let port = self.reserve_port(&definition.core.kind).await?;
 
     let prepared_result = if let Some(persistence) = &spec.persistence {
@@ -1020,7 +1073,7 @@ impl InstanceManager {
       )
       .await
     } else {
-      layout::prepare(&self.config, &spec.definition_id, port).await
+      layout::prepare_with_definition(&self.config, &spec.definition_id, port, definition).await
     };
     let prepared = match prepared_result {
       Ok(prepared) => prepared,
@@ -1159,6 +1212,8 @@ impl InstanceManager {
         solo_session_id,
         preserve_solo_session,
         solo_persistence: spec.persistence,
+        persistent_world: prepared.persistent_world.clone(),
+        _persistent_world_lease: persistent_world_lease,
         completion: completion_sender,
         port,
       },
@@ -1309,11 +1364,11 @@ impl InstanceManager {
     }
     loop {
       if let Some(result) = completion.borrow().clone() {
-        result.map_err(ManagerError::State)?;
+        result.map_err(ManagerError::Completion)?;
         break;
       }
       completion.changed().await.map_err(|_| {
-        ManagerError::State("process supervisor dropped the completion signal".into())
+        ManagerError::Completion("process supervisor dropped the completion signal".into())
       })?;
     }
     Ok(instance.info.read().await.clone())
@@ -1399,7 +1454,7 @@ impl InstanceManager {
     self.launch_reserved(spec, Vec::new()).await
   }
 
-  pub async fn stop_all(&self) {
+  pub async fn stop_all(&self) -> Vec<(String, String)> {
     self.shutting_down.store(true, Ordering::Release);
     let ids = self
       .instances
@@ -1408,9 +1463,13 @@ impl InstanceManager {
       .keys()
       .cloned()
       .collect::<Vec<_>>();
+    let mut failures = Vec::new();
     for id in ids {
-      let _ = self.stop(&id).await;
+      if let Err(error) = self.stop(&id).await {
+        failures.push((id, error.to_string()));
+      }
     }
+    failures
   }
 
   pub async fn command(
@@ -2104,6 +2163,8 @@ struct SupervisionContext {
   solo_session_id: Arc<Mutex<Option<String>>>,
   preserve_solo_session: Arc<AtomicBool>,
   solo_persistence: Option<SoloPersistence>,
+  persistent_world: Option<PersistentWorld>,
+  _persistent_world_lease: Option<PersistentWorldLease>,
   completion: watch::Sender<Option<Result<(), String>>>,
   port: u16,
 }
@@ -2158,7 +2219,31 @@ async fn supervise(
     .retain(|_, transfer| transfer.server_id != context.runtime_id);
   let runtime_root = context.config.resolve(&context.config.value.paths.runtime);
   let mut cleanup_result = Ok(());
-  if let Some(persistence) = &context.solo_persistence {
+  if let Some(persistent) = &context.persistent_world {
+    let persist_result = async {
+      world_store::persist(persistent, &context.work_dir).await?;
+      world_store::remove_recovery_marker(&context.work_dir).await
+    }
+    .await;
+    if let Err(error) = persist_result {
+      cleanup_result = Err(format!(
+        "failed to persist world package {}: {error}; recovery data retained at {}",
+        persistent.id,
+        context.work_dir.display()
+      ));
+      context
+        .logs
+        .append(
+          "scheduler",
+          &format!(
+            "failed to persist world package {}: {error}; recovery data retained at {}",
+            persistent.id,
+            context.work_dir.display()
+          ),
+        )
+        .await;
+    }
+  } else if let Some(persistence) = &context.solo_persistence {
     let persist_result = async {
       solo::persist_world(persistence, &context.work_dir.join("world")).await?;
       let mut metadata = solo::read_metadata(&persistence.root).await?;
@@ -2504,10 +2589,16 @@ pub enum ManagerError {
   Layout(#[from] layout::LayoutError),
   #[error(transparent)]
   Solo(#[from] solo::SoloError),
+  #[error(transparent)]
+  WorldStore(#[from] world_store::WorldStoreError),
   #[error("server {0} is already running")]
   AlreadyRunning(String),
   #[error("server {0} is not running")]
   NotRunning(String),
+  #[error("persistent world {0} is already in use")]
+  PersistentWorldInUse(String),
+  #[error("persistent world {world_id} has unsaved recovery data at {path}")]
+  PersistentWorldRecovery { world_id: String, path: PathBuf },
   #[error("server {0} does not exist in the runtime registry")]
   NotFound(String),
   #[error("server port {0} is already allocated")]
@@ -2532,6 +2623,8 @@ pub enum ManagerError {
   },
   #[error("invalid runtime state: {0}")]
   State(String),
+  #[error("server process completion failed: {0}")]
+  Completion(String),
   #[error(transparent)]
   Process(#[from] io::Error),
 }
@@ -2726,7 +2819,26 @@ mod tests {
       log_file,
       environment: Default::default(),
       dependency_snapshot: DependencySnapshot::new(),
+      persistent_world: None,
     }
+  }
+
+  #[test]
+  fn persistent_world_lease_prevents_concurrent_writers() {
+    let reservations = Arc::new(StdMutex::new(HashSet::new()));
+    let persistent = PersistentWorld {
+      id: "survival".into(),
+      root: PathBuf::from("worlds/survival"),
+      paths: vec![PathBuf::from("world")],
+    };
+
+    let first = PersistentWorldLease::acquire(reservations.clone(), &persistent).unwrap();
+    assert!(matches!(
+      PersistentWorldLease::acquire(reservations.clone(), &persistent),
+      Err(ManagerError::PersistentWorldInUse(id)) if id == "survival"
+    ));
+    drop(first);
+    assert!(PersistentWorldLease::acquire(reservations, &persistent).is_ok());
   }
 
   #[test]
@@ -3827,7 +3939,7 @@ mod tests {
 
   #[cfg(unix)]
   #[tokio::test]
-  async fn stop_waits_for_runtime_removal_and_preserves_dependencies_and_logs() {
+  async fn stop_waits_for_persistent_world_dependencies_and_runtime_cleanup() {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = tempfile::tempdir().unwrap();
@@ -3839,13 +3951,19 @@ mod tests {
     fs::create_dir_all(root.join("java21/bin")).await.unwrap();
     fs::create_dir_all(root.join("java25/bin")).await.unwrap();
     fs::create_dir_all(root.join("servers")).await.unwrap();
+    fs::create_dir_all(root.join("worlds/survival/world"))
+      .await
+      .unwrap();
+    fs::write(root.join("worlds/survival/world/level.dat"), b"old")
+      .await
+      .unwrap();
     fs::write(root.join("cores/paper/1.21.11/server.jar"), b"server")
       .await
       .unwrap();
     let java = root.join("java21/bin/java");
     fs::write(
       &java,
-      b"#!/bin/sh\nmkdir -p libraries\nprintf runtime > libraries/generated.jar\nprintf 'started\\n'\nwhile IFS= read -r line; do\n  if [ \"$line\" = \"stop\" ]; then\n    exit 0\n  fi\ndone\n",
+      b"#!/bin/sh\nmkdir -p libraries world\nprintf runtime > libraries/generated.jar\ncp world/level.dat world/loaded.dat\nprintf updated > world/level.dat\nprintf 'started\\n'\nwhile IFS= read -r line; do\n  if [ \"$line\" = \"stop\" ]; then\n    exit 0\n  fi\ndone\n",
     )
     .await
     .unwrap();
@@ -3907,6 +4025,11 @@ mod tests {
         "memory": {
           "initial_mib": 128,
           "maximum_mib": 256
+        },
+        "world": {
+          "mode": "persistent",
+          "id": "survival",
+          "paths": ["world"]
         }
       }))
       .unwrap(),
@@ -3990,6 +4113,8 @@ mod tests {
         solo_session_id,
         preserve_solo_session,
         solo_persistence: None,
+        persistent_world: prepared.persistent_world.clone(),
+        _persistent_world_lease: None,
         completion: completion_sender,
         port,
       },
@@ -4012,6 +4137,18 @@ mod tests {
     assert_eq!(stopped.state, InstanceState::Exited);
     assert!(!instance.work_dir.exists());
     assert!(instance.log_file.exists());
+    assert_eq!(
+      fs::read(root.join("worlds/survival/world/level.dat"))
+        .await
+        .unwrap(),
+      b"updated"
+    );
+    assert_eq!(
+      fs::read(root.join("worlds/survival/world/loaded.dat"))
+        .await
+        .unwrap(),
+      b"old"
+    );
     assert!(
       !runtime::staging_root(&config.resolve(&config.value.paths.runtime))
         .unwrap()

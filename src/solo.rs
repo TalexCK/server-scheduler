@@ -8,6 +8,8 @@ use thiserror::Error;
 use tokio::fs;
 use uuid::Uuid;
 
+use crate::world_store::{copy_tree, remove_path, try_exists};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SoloWorldMetadata {
   pub game: String,
@@ -136,7 +138,7 @@ pub async fn materialize_world(
     return Err(SoloError::MissingWorld(source));
   }
   remove_path(runtime_world).await?;
-  copy_tree(&source, runtime_world).await
+  copy_tree(&source, runtime_world).await.map_err(Into::into)
 }
 
 pub async fn persist_world(
@@ -155,7 +157,7 @@ pub async fn persist_world(
     .join(format!(".world-backup-{}", Uuid::new_v4()));
   if let Err(error) = copy_tree(runtime_world, &staging).await {
     let _ = fs::remove_dir_all(&staging).await;
-    return Err(error);
+    return Err(error.into());
   }
   let had_target = try_exists(&target).await?;
   if had_target && let Err(source) = fs::rename(&target, &backup).await {
@@ -230,76 +232,6 @@ pub async fn destroy_storage(persistence: &SoloPersistence) -> Result<(), SoloEr
   }
 }
 
-async fn copy_tree(source: &Path, target: &Path) -> Result<(), SoloError> {
-  let metadata = fs::symlink_metadata(source)
-    .await
-    .map_err(|source_error| SoloError::Io {
-      path: source.to_path_buf(),
-      source: source_error,
-    })?;
-  if !metadata.is_dir() || metadata.file_type().is_symlink() {
-    return Err(SoloError::InvalidWorld(source.to_path_buf()));
-  }
-  create_dir_all(target).await?;
-  let mut pending = vec![(source.to_path_buf(), target.to_path_buf())];
-  while let Some((source_dir, target_dir)) = pending.pop() {
-    let mut entries = fs::read_dir(&source_dir)
-      .await
-      .map_err(|source| SoloError::Io {
-        path: source_dir.clone(),
-        source,
-      })?;
-    while let Some(entry) = entries.next_entry().await.map_err(|source| SoloError::Io {
-      path: source_dir.clone(),
-      source,
-    })? {
-      if entry.file_name() == "session.lock" {
-        continue;
-      }
-      let source_path = entry.path();
-      let target_path = target_dir.join(entry.file_name());
-      let file_type = entry.file_type().await.map_err(|source| SoloError::Io {
-        path: source_path.clone(),
-        source,
-      })?;
-      if file_type.is_symlink() {
-        return Err(SoloError::InvalidWorld(source_path));
-      }
-      if file_type.is_dir() {
-        create_dir_all(&target_path).await?;
-        pending.push((source_path, target_path));
-      } else if file_type.is_file() {
-        fs::copy(&source_path, &target_path)
-          .await
-          .map_err(|source| SoloError::Io {
-            path: target_path,
-            source,
-          })?;
-      }
-    }
-  }
-  Ok(())
-}
-
-async fn remove_path(path: &Path) -> Result<(), SoloError> {
-  let Ok(metadata) = fs::symlink_metadata(path).await else {
-    return Ok(());
-  };
-  if metadata.file_type().is_symlink() || metadata.is_file() {
-    fs::remove_file(path).await.map_err(|source| SoloError::Io {
-      path: path.to_path_buf(),
-      source,
-    })
-  } else {
-    fs::remove_dir_all(path)
-      .await
-      .map_err(|source| SoloError::Io {
-        path: path.to_path_buf(),
-        source,
-      })
-  }
-}
-
 async fn create_dir_all(path: &Path) -> Result<(), SoloError> {
   fs::create_dir_all(path)
     .await
@@ -309,15 +241,10 @@ async fn create_dir_all(path: &Path) -> Result<(), SoloError> {
     })
 }
 
-async fn try_exists(path: &Path) -> Result<bool, SoloError> {
-  fs::try_exists(path).await.map_err(|source| SoloError::Io {
-    path: path.to_path_buf(),
-    source,
-  })
-}
-
 #[derive(Debug, Error)]
 pub enum SoloError {
+  #[error(transparent)]
+  WorldStore(#[from] crate::world_store::WorldStoreError),
   #[error("failed to access {path}: {source}")]
   Io { path: PathBuf, source: io::Error },
   #[error("failed to parse {path}: {source}")]
@@ -329,8 +256,6 @@ pub enum SoloError {
   AlreadyExists(PathBuf),
   #[error("solo world is missing at {0}")]
   MissingWorld(PathBuf),
-  #[error("solo world contains an invalid entry at {0}")]
-  InvalidWorld(PathBuf),
 }
 
 #[cfg(test)]
