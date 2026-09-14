@@ -992,10 +992,24 @@ impl InstanceManager {
       .load_server(server_id)
       .await
       .map_err(layout::LayoutError::from)?;
-    if definition.gamevoting.as_ref().is_some_and(|game| game.solo) {
-      return Err(ManagerError::State(
-        "solo servers must be launched through the solo session API".into(),
-      ));
+    if let Some(game) = definition.gamevoting.as_ref().filter(|game| game.solo) {
+      if game.solo_mode != SoloMode::Shared || !game.voting_enabled() {
+        return Err(ManagerError::State(
+          "solo servers must be launched through the solo session API".into(),
+        ));
+      }
+      // Share the solo launch lock so simultaneous voting and solo requests use one backend.
+      let _operations = self.solo_operations.lock().await;
+      self.wait_for_launch_registration(server_id).await;
+      if let Some(instance) = self.instances.read().await.get(server_id).cloned()
+        && instance.info.read().await.state.active()
+      {
+        self.queue_transfers(server_id, players).await?;
+        return Ok(instance.info.read().await.clone());
+      }
+      return self
+        .launch_with_spec(LaunchSpec::static_server(server_id), players)
+        .await;
     }
     self
       .launch_with_spec(LaunchSpec::static_server(server_id), players)
@@ -1268,9 +1282,7 @@ impl InstanceManager {
       .await
       .map_err(layout::LayoutError::from)?;
     if definition.gamevoting.as_ref().is_some_and(|game| game.solo) {
-      return Err(ManagerError::State(
-        "solo servers must be launched through the solo session API".into(),
-      ));
+      return self.launch(server_id, players).await;
     }
     if let Some(instance) = self.instances.read().await.get(server_id).cloned()
       && instance.info.read().await.state.active()
@@ -2496,7 +2508,12 @@ fn validate_solo_roster(
     ));
   }
   let count = u32::try_from(players.len()).unwrap_or(u32::MAX);
-  if count < game.min_players || count > game.max_players || count > game.solo_max_players {
+  let minimum = if game.solo_mode == SoloMode::Shared {
+    1
+  } else {
+    game.min_players
+  };
+  if count < minimum || count > game.max_players || count > game.solo_max_players {
     return Err(ManagerError::State(format!(
       "solo session player count {count} is outside the configured range"
     )));
@@ -3373,6 +3390,162 @@ mod tests {
     assert_eq!(updated.owner, second);
     assert_eq!(updated.players, vec![second]);
     assert_eq!(manager.solo_sessions().await.len(), 1);
+  }
+
+  async fn shared_voting_test_manager() -> (tempfile::TempDir, InstanceManager) {
+    let (directory, manager) = solo_test_manager(SoloMode::Shared, SoloStartup::OnDemand).await;
+    let file = directory.path().join("servers/game.json");
+    let mut definition: serde_json::Value =
+      serde_json::from_slice(&fs::read(&file).await.unwrap()).unwrap();
+    definition["gamevoting"]["voting"] = serde_json::json!(true);
+    definition["gamevoting"]["min_players"] = serde_json::json!(2);
+    definition["gamevoting"]["solo_max_players"] = serde_json::json!(1);
+    definition["world"] =
+      serde_json::json!({"mode": "persistent", "id": "puzzle", "paths": ["world"]});
+    fs::write(file, serde_json::to_vec(&definition).unwrap())
+      .await
+      .unwrap();
+    (directory, manager)
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn shared_voting_and_solo_reuse_instance_and_save_world_in_both_launch_orders() {
+    for voting_first in [true, false] {
+      let (directory, manager) = shared_voting_test_manager().await;
+      let player = Uuid::new_v4();
+      let voter = Uuid::new_v4();
+      manager
+        .replace_players(vec![presence(player), presence(voter)])
+        .await;
+      // Voting pre-starts with no roster; solo permits one player even when voting needs two.
+      let first = if voting_first {
+        manager.ensure_started("game", vec![]).await.unwrap()
+      } else {
+        manager
+          .launch_solo("puzzle", player, vec![player])
+          .await
+          .unwrap()
+      };
+      let runtime = manager
+        .instance("game")
+        .await
+        .unwrap()
+        .info
+        .read()
+        .await
+        .work_dir
+        .clone();
+      assert_eq!(
+        fs::read(runtime.join("world/level.dat")).await.unwrap(),
+        b"template"
+      );
+      manager.ready("game", first.instance_id).await.unwrap();
+      let joined = if voting_first {
+        manager
+          .launch_solo("puzzle", player, vec![player])
+          .await
+          .unwrap()
+      } else {
+        manager
+          .ensure_started("game", vec![voter.to_string()])
+          .await
+          .unwrap()
+      };
+      assert_eq!(first.instance_id, joined.instance_id);
+      assert_eq!(joined.state, InstanceState::Ready);
+      let repeated = manager
+        .launch("game", vec![voter.to_string()])
+        .await
+        .unwrap();
+      assert_eq!(first.instance_id, repeated.instance_id);
+      assert_eq!(
+        manager.solo_access().await.unwrap()[0].access,
+        SoloAccessMode::Open
+      );
+      assert!(
+        manager
+          .transfers
+          .lock()
+          .await
+          .values()
+          .any(|transfer| transfer.player == player.to_string())
+      );
+      assert!(
+        manager
+          .transfers
+          .lock()
+          .await
+          .values()
+          .any(|transfer| transfer.player == voter.to_string())
+      );
+      fs::write(runtime.join("world/level.dat"), b"saved-progress")
+        .await
+        .unwrap();
+      manager.stop("game").await.unwrap();
+      assert_eq!(
+        fs::read(directory.path().join("worlds/puzzle/world/level.dat"))
+          .await
+          .unwrap(),
+        b"saved-progress"
+      );
+      let restarted = manager
+        .launch_solo("puzzle", player, vec![player])
+        .await
+        .unwrap();
+      assert_ne!(first.instance_id, restarted.instance_id);
+      let runtime = manager
+        .instance("game")
+        .await
+        .unwrap()
+        .info
+        .read()
+        .await
+        .work_dir
+        .clone();
+      assert_eq!(
+        fs::read(runtime.join("world/level.dat")).await.unwrap(),
+        b"saved-progress"
+      );
+      manager.stop("game").await.unwrap();
+    }
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn concurrent_shared_voting_and_solo_launch_only_one_instance() {
+    let (_directory, manager) = shared_voting_test_manager().await;
+    let solo_player = Uuid::new_v4();
+    let voter = Uuid::new_v4();
+    manager
+      .replace_players(vec![presence(solo_player), presence(voter)])
+      .await;
+    let (voting, solo) = tokio::join!(
+      manager.ensure_started("game", vec![voter.to_string()]),
+      manager.launch_solo("puzzle", solo_player, vec![solo_player])
+    );
+    assert_eq!(voting.unwrap().instance_id, solo.unwrap().instance_id);
+    assert_eq!(
+      manager
+        .instance("game")
+        .await
+        .unwrap()
+        .pending_players
+        .lock()
+        .await
+        .clone(),
+      HashSet::from([voter.to_string(), solo_player.to_string()])
+    );
+    manager.stop("game").await.unwrap();
+  }
+
+  #[tokio::test]
+  async fn solo_only_games_still_reject_the_voting_launch_api() {
+    for mode in [SoloMode::Shared, SoloMode::PlayerWorld] {
+      let (_directory, manager) = solo_test_manager(mode, SoloStartup::OnDemand).await;
+      assert!(manager.ensure_started("game", vec![]).await.is_err());
+      assert!(manager.launch("game", vec![]).await.is_err());
+    }
   }
 
   #[cfg(unix)]

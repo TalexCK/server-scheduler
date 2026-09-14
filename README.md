@@ -380,14 +380,54 @@ Velocity 在线状态把玩家 UUID 解析为合法用户名，并先向目标�
 
 `gamevoting.solo` 默认为 `false`。启用后，`solo_mode` 支持 `shared` 和
 `player_world`，`solo_startup` 支持 `always` 和 `on_demand`，默认分别为 `shared`
-和 `on_demand`。`solo_max_players` 限制单次启动请求人数；请求还必须同时满足游戏的
-`min_players` 与 `max_players`。`player_world` 仅允许 1 或 2 人，并强制使用
+和 `on_demand`。`solo_max_players` 限制单次启动请求人数，且不能超过 `max_players`。
+共享模式允许单人进入，不受投票的 `min_players` 限制；`player_world` 请求仍须满足
+`min_players`。`player_world` 仅允许 1 或 2 人，并强制使用
 `on_demand`、关闭服务器级 `autostart`，且 `level-name` 必须为 `world`。
 
 `shared` 使用服务器定义对应的开放静态后端，不冻结玩家名单。`always` 会让 Scheduler
 保持后端运行，`on_demand` 在首个请求时启动。任意在线玩家都可通过 Solo 请求启动或加入
 同一实例，每次请求中的玩家列表只用于该次传送。组合启动接口会原子串行化启动与传送，
 并发请求不会相互覆盖。
+
+### 同时支持投票和单人入口的共享存档游戏
+
+`gamevoting.voting` 独立控制投票列表。省略时默认是 `!solo`，保留已有配置行为；
+设置 `solo: true`、`solo_mode: "shared"`、`voting: true` 后，同一个游戏同时出现在
+投票和单人页面。`player_world` 不允许开启投票，以保留私人世界的固定名单约束。
+
+在服务器 JSON 中合并以下配置（其余 core、memory、plugins 等字段沿用目标服务器）：
+
+```json
+{
+  "world": {
+    "mode": "persistent",
+    "id": "shared_adventure",
+    "paths": ["world", "world_nether", "world_the_end"]
+  },
+  "gamevoting": {
+    "id": "shared_adventure",
+    "name": "共享冒险",
+    "material": "GRASS_BLOCK",
+    "min_players": 1,
+    "max_players": 50,
+    "solo": true,
+    "voting": true,
+    "solo_mode": "shared",
+    "solo_startup": "on_demand",
+    "solo_max_players": 1
+  }
+}
+```
+
+地图放在 `worlds/shared_adventure/world/`（其他维度按实际服务端目录布局配置）。
+启动会把持久存档复制到 runtime，停服完成后保存回同一目录，下次启动继续使用保存进度。
+共享存档沿用 persistent 的原子保存、并发写入保护和失败恢复机制，不按玩家创建副本，
+也不受 `solo_retention_days` 的私人存档到期清理影响。
+
+投票预启动和单人请求共同复用服务器定义的静态 ID。实例已 READY 时直接向该实例
+创建传送任务；正在启动时加入待传送队列；两个入口并发启动只创建一个实例。
+投票请求人数不受 `solo_max_players` 限制，该限制仅用于单人入口的单次请求。
 
 `player_world` 为每份名单创建独立动态实例、端口和 Velocity 服务器 ID。地图母版必须放在
 `worlds/<game-id>/world`，持久副本位于
@@ -518,6 +558,8 @@ Velocity 应先匹配当前实例 UUID；`open` 允许任意玩家进入，`rost
 创建新世界。管理 API 的同名启动接口不接收表单，继续使用完整会话名单并返回 JSON。
 `GET /bridge/v1/games` 在原有 12 列后追加 `solo`、Base64 编码的 `solo_mode`、Base64
 编码的 `solo_startup`、`solo_max_players` 和 `solo_retention_days`，共 17 列。
+新版 Bridge 请求 `GET /bridge/v1/games?include_voting=true`，追加解析后的 `voting`
+布尔值作为第 18 列。未带参数的旧客户端仍获得 17 列；新版客户端兼容旧的 12/17 列响应。
 `GET /bridge/v1/games/details` 保持前 17 列一致，并追加以 `U+001F` 连接后 Base64 编码
 的 `rules` 和 `aliases`，共 19 列，供 Velocity `/game` 显示完整介绍与规则。旧 Bridge
 继续使用 17 列接口，不受详细目录扩展影响。

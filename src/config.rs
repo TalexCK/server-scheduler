@@ -549,6 +549,9 @@ pub struct GameVotingDefinition {
   pub max_players: u32,
   #[serde(default)]
   pub solo: bool,
+  /// Omitted preserves the historical voting-only / solo-only catalog split.
+  #[serde(default)]
+  pub voting: Option<bool>,
   #[serde(default)]
   pub solo_mode: SoloMode,
   #[serde(default)]
@@ -560,8 +563,17 @@ pub struct GameVotingDefinition {
 }
 
 impl GameVotingDefinition {
+  pub fn voting_enabled(&self) -> bool {
+    self.voting.unwrap_or(!self.solo)
+  }
+
   fn validate(&self) -> Result<(), ConfigError> {
     validate_id(&self.id)?;
+    if self.voting_enabled() && self.solo_mode == SoloMode::PlayerWorld {
+      return Err(ConfigError::Validation(
+        "player_world solo_mode cannot enable voting".into(),
+      ));
+    }
     if self.name.trim().is_empty() {
       return Err(ConfigError::Validation(
         "GameVoting name must not be empty".into(),
@@ -603,7 +615,8 @@ impl GameVotingDefinition {
       ));
     }
     if self.solo
-      && (self.solo_max_players < self.min_players || self.solo_max_players > self.max_players)
+      && ((self.solo_mode == SoloMode::PlayerWorld && self.solo_max_players < self.min_players)
+        || self.solo_max_players > self.max_players)
     {
       return Err(ConfigError::Validation(
         "GameVoting solo_max_players is outside the game player range".into(),
@@ -1115,6 +1128,28 @@ mod tests {
     assert_eq!(game.solo_max_players, 1);
     assert_eq!(game.solo_retention_days, 10);
     assert!(!definition.operator_players);
+  }
+
+  #[test]
+  fn voting_defaults_preserve_old_catalogs_and_shared_games_can_opt_in() {
+    let mut game: GameVotingDefinition = serde_json::from_value(serde_json::json!({
+      "id": "puzzle", "name": "Puzzle", "material": "MAP"
+    }))
+    .unwrap();
+    assert!(game.voting_enabled());
+    game.solo = true;
+    assert!(!game.voting_enabled());
+    game.voting = Some(true);
+    game.min_players = 2;
+    game.solo_max_players = 1;
+    assert!(game.voting_enabled());
+    assert!(game.validate().is_ok());
+    game.solo_mode = SoloMode::PlayerWorld;
+    assert!(game.validate().is_err());
+    game.voting = Some(false);
+    game.min_players = 1;
+    assert!(game.validate().is_ok());
+    assert!(!game.voting_enabled());
   }
 
   #[test]

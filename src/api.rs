@@ -497,7 +497,16 @@ async fn bridge_definitions(State(state): State<ApiState>) -> Result<String, Api
   Ok(ids.into_iter().map(|id| format!("{id}\n")).collect())
 }
 
-async fn bridge_games(State(state): State<ApiState>) -> Result<String, ApiError> {
+#[derive(Default, Deserialize)]
+struct GameCatalogQuery {
+  #[serde(default)]
+  include_voting: bool,
+}
+
+async fn bridge_games(
+  State(state): State<ApiState>,
+  Query(query): Query<GameCatalogQuery>,
+) -> Result<String, ApiError> {
   let games = state
     .config
     .game_definitions()
@@ -507,7 +516,7 @@ async fn bridge_games(State(state): State<ApiState>) -> Result<String, ApiError>
   Ok(
     games
       .into_iter()
-      .map(|(server_id, game)| format_game_catalog_entry(&server_id, &game))
+      .map(|(server_id, game)| format_game_catalog_entry(&server_id, &game, query.include_voting))
       .collect(),
   )
 }
@@ -651,8 +660,9 @@ async fn bridge_solo_destroy(
 fn format_game_catalog_entry(
   server_id: &str,
   game: &crate::config::GameVotingDefinition,
+  include_voting: bool,
 ) -> String {
-  format!(
+  let mut entry = format!(
     "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
     game.order,
     encode_game_field(&game.id),
@@ -671,7 +681,12 @@ fn format_game_catalog_entry(
     encode_game_field(game.solo_startup.as_str()),
     game.solo_max_players,
     game.solo_retention_days
-  )
+  );
+  if include_voting {
+    entry.pop();
+    entry.push_str(&format!("\t{}\n", game.voting_enabled()));
+  }
+  entry
 }
 
 fn format_game_details_entry(
@@ -1012,13 +1027,29 @@ mod tests {
       "solo_retention_days": 10
     }))
     .unwrap();
-    let line = format_game_catalog_entry("puzzle-server", &game);
+    let line = format_game_catalog_entry("puzzle-server", &game, false);
     let fields = line.trim_end_matches('\n').split('\t').collect::<Vec<_>>();
     assert_eq!(fields.len(), 17);
     assert_eq!(fields[12], "true");
     assert_eq!(STANDARD_NO_PAD.decode(fields[13]).unwrap(), b"player_world");
     assert_eq!(STANDARD_NO_PAD.decode(fields[14]).unwrap(), b"on_demand");
     assert_eq!(&fields[15..], ["2", "10"]);
+  }
+
+  #[test]
+  fn game_catalog_negotiates_voting_without_changing_legacy_columns() {
+    let game = serde_json::from_value(serde_json::json!({
+      "id": "shared", "name": "Shared", "material": "MAP", "solo": true, "voting": true
+    }))
+    .unwrap();
+    let legacy = format_game_catalog_entry("shared-server", &game, false);
+    let extended = format_game_catalog_entry("shared-server", &game, true);
+    assert_eq!(
+      extended,
+      format!("{}\ttrue\n", legacy.trim_end_matches('\n'))
+    );
+    let query: GameCatalogQuery = serde_json::from_value(serde_json::json!({})).unwrap();
+    assert!(!query.include_voting);
   }
 
   #[test]
