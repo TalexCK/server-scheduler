@@ -1,0 +1,18 @@
+{
+  "survival": {
+    "address": "survival.talexck.com:25565",
+    "minecraft_version": "26.2",
+    "gamevoting": {
+      "order": 300,
+      "id": "survival",
+      "name": "&a&l生存服务器",
+      "description": ["&7点击进入生存服务器", "&7使用 /hub 返回大厅"],
+      "material": "GRASS_BLOCK",
+      "min_players": 1,
+      "max_players": 50,
+      "solo": true,
+      "voting": false,
+      "solo_mode": "shared"
+    }
+  }
+}

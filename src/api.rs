@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
   Json, Router,
@@ -17,10 +17,9 @@ use crate::{
   config::LoadedConfig,
   manager::{InstanceManager, ManagerError},
   protocol::{
-    CommandRequest, CommandResponse, HeartbeatForm, IdleForm, LaunchRequest,
-    LeaderboardEntryRequest, LeaderboardPeriod, LogResponse, PlayerListForm, PlayerPresence,
-    PlayersForm, ReadyForm, SoloDestroyForm, SoloLaunchForm, SoloSessionCreateRequest,
-    SoloSessionInfo, TransferResultForm,
+    CommandRequest, CommandResponse, HeartbeatForm, IdleForm, LaunchRequest, LogResponse,
+    PlayerListForm, PlayerPresence, PlayersForm, ReadyForm, SoloDestroyForm, SoloLaunchForm,
+    SoloSessionCreateRequest, SoloSessionInfo, TransferResultForm,
   },
 };
 
@@ -29,7 +28,6 @@ pub struct ApiState {
   pub config: Arc<LoadedConfig>,
   pub manager: InstanceManager,
   pub shutdown: broadcast::Sender<()>,
-  pub public_database: Option<crate::public_database::PublicDatabase>,
 }
 
 #[derive(Clone)]
@@ -76,6 +74,10 @@ pub fn router(state: ApiState) -> Router {
     .route("/definitions", get(bridge_definitions))
     .route("/games", get(bridge_games))
     .route("/games/details", get(bridge_game_details))
+    .route(
+      "/external-servers/{server_id}/join",
+      post(bridge_join_external),
+    )
     .route("/solo/access", get(bridge_solo_access))
     .route("/solo/{game_id}/launch", post(bridge_solo_launch))
     .route("/solo/{game_id}/destroy", post(bridge_solo_destroy))
@@ -104,8 +106,6 @@ pub fn router(state: ApiState) -> Router {
     .route("/servers/{server_id}/command", post(bridge_command))
     .route("/transfers", get(pending_transfers))
     .route("/transfers/result", post(transfer_result))
-    .route("/leaderboards", post(bridge_upsert_leaderboard))
-    .route("/sync", post(bridge_sync))
     .route_layer(middleware::from_fn_with_state(
       AuthState {
         token: Arc::from(state.config.value.bridge.token.clone()),
@@ -118,179 +118,6 @@ pub fn router(state: ApiState) -> Router {
     .nest("/admin/v1", admin)
     .nest("/bridge/v1", bridge)
     .with_state(state)
-}
-
-async fn bridge_upsert_leaderboard(
-  State(state): State<ApiState>,
-  Json(mut entry): Json<LeaderboardEntryRequest>,
-) -> Result<StatusCode, ApiError> {
-  validate_leaderboard_entry(&mut entry)?;
-  let database = state.public_database.as_ref().ok_or_else(|| {
-    ApiError::new(
-      StatusCode::SERVICE_UNAVAILABLE,
-      "public database publication is disabled",
-    )
-  })?;
-  database
-    .upsert_leaderboard_entry(&entry)
-    .await
-    .map_err(|error| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
-  Ok(StatusCode::NO_CONTENT)
-}
-
-const BINGO_SYNC_COMMAND: &str = "bingo_stats sync";
-
-async fn bridge_sync(State(state): State<ApiState>) -> Result<String, ApiError> {
-  let database = state.public_database.as_ref().ok_or_else(|| {
-    ApiError::new(
-      StatusCode::SERVICE_UNAVAILABLE,
-      "public database publication is disabled",
-    )
-  })?;
-  database
-    .publish(&state.config, &state.manager)
-    .await
-    .map_err(|error| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
-
-  let bingo_server_ids = state
-    .config
-    .game_definitions()
-    .await
-    .map_err(crate::layout::LayoutError::from)
-    .map_err(ManagerError::from)?
-    .into_iter()
-    .filter(|(_, game)| game.id.eq_ignore_ascii_case("bingo"))
-    .map(|(server_id, _)| server_id)
-    .collect::<BTreeSet<_>>();
-  let bingo_backend_ids = state
-    .manager
-    .solo_sessions()
-    .await
-    .into_iter()
-    .filter(|session| session.game_id.eq_ignore_ascii_case("bingo"))
-    .map(|session| session.backend_id)
-    .collect::<BTreeSet<_>>();
-  let targets = ready_bingo_instances(
-    state.manager.list().await,
-    &bingo_server_ids,
-    &bingo_backend_ids,
-  );
-
-  let mut report = vec!["Public database snapshot published.".to_string()];
-  if targets.is_empty() {
-    report.push("No READY Bingo instances were available for leaderboard sync.".to_string());
-    return Ok(join_lines(report));
-  }
-
-  let mut submitted = 0usize;
-  let mut failed = 0usize;
-  for server_id in targets {
-    match state
-      .manager
-      .command(&server_id, BINGO_SYNC_COMMAND.to_string())
-      .await
-    {
-      Ok(output) if output.is_empty() => {
-        submitted += 1;
-        report.push(format!(
-          "{server_id}: sync command submitted; no output was captured."
-        ));
-      }
-      Ok(output) => {
-        submitted += 1;
-        report.push(format!("{server_id}: sync command submitted."));
-        report.extend(
-          output
-            .into_iter()
-            .map(|line| format!("{server_id}: {line}")),
-        );
-      }
-      Err(error) => {
-        failed += 1;
-        report.push(format!("{server_id}: sync command failed: {error}"));
-      }
-    }
-  }
-  report.push(format!(
-    "Bingo sync trigger summary: {submitted} submitted, {failed} failed."
-  ));
-  Ok(join_lines(report))
-}
-
-fn ready_bingo_instances(
-  instances: Vec<crate::protocol::InstanceInfo>,
-  bingo_server_ids: &BTreeSet<String>,
-  bingo_backend_ids: &BTreeSet<String>,
-) -> Vec<String> {
-  instances
-    .into_iter()
-    .filter(|instance| instance.state == crate::protocol::InstanceState::Ready)
-    .filter(|instance| {
-      bingo_server_ids.contains(&instance.server_id)
-        || bingo_backend_ids.contains(&instance.server_id)
-    })
-    .map(|instance| instance.server_id)
-    .collect()
-}
-
-fn validate_leaderboard_entry(entry: &mut LeaderboardEntryRequest) -> Result<(), ApiError> {
-  entry.game = entry.game.trim().to_ascii_lowercase();
-  entry.metric = entry.metric.trim().to_ascii_lowercase();
-  entry.player_id = entry.player_id.trim().to_owned();
-  entry.username = entry.username.trim().to_owned();
-  if entry.game != "bingo" {
-    return Err(ApiError::new(StatusCode::BAD_REQUEST, "game must be bingo"));
-  }
-  if !valid_identifier(&entry.metric, 64) {
-    return Err(ApiError::new(
-      StatusCode::BAD_REQUEST,
-      "metric must be a lowercase identifier",
-    ));
-  }
-  if entry.player_id.is_empty() || entry.player_id.len() > 64 {
-    return Err(ApiError::new(StatusCode::BAD_REQUEST, "invalid player_id"));
-  }
-  if entry.username.is_empty() || entry.username.len() > 64 {
-    return Err(ApiError::new(StatusCode::BAD_REQUEST, "invalid username"));
-  }
-  if entry.score <= 0 {
-    return Err(ApiError::new(
-      StatusCode::BAD_REQUEST,
-      "score must be a positive duration in milliseconds",
-    ));
-  }
-  match entry.period {
-    LeaderboardPeriod::Month => {
-      let key = entry.period_key.as_deref().unwrap_or_default();
-      if !valid_month_key(key) {
-        return Err(ApiError::new(
-          StatusCode::BAD_REQUEST,
-          "month period_key must use YYYY-MM",
-        ));
-      }
-    }
-    LeaderboardPeriod::AllTime => entry.period_key = None,
-  }
-  Ok(())
-}
-
-fn valid_identifier(value: &str, max_len: usize) -> bool {
-  !value.is_empty()
-    && value.len() <= max_len
-    && value
-      .bytes()
-      .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-}
-
-fn valid_month_key(value: &str) -> bool {
-  let Some((year, month)) = value.split_once('-') else {
-    return false;
-  };
-  year.len() == 4
-    && year.bytes().all(|byte| byte.is_ascii_digit())
-    && month.len() == 2
-    && month.bytes().all(|byte| byte.is_ascii_digit())
-    && matches!(month.parse::<u8>(), Ok(1..=12))
 }
 
 async fn require_token(
@@ -501,6 +328,8 @@ async fn bridge_definitions(State(state): State<ApiState>) -> Result<String, Api
 struct GameCatalogQuery {
   #[serde(default)]
   include_voting: bool,
+  #[serde(default)]
+  include_external: bool,
 }
 
 async fn bridge_games(
@@ -513,12 +342,42 @@ async fn bridge_games(
     .await
     .map_err(crate::layout::LayoutError::from)
     .map_err(ManagerError::from)?;
-  Ok(
-    games
-      .into_iter()
-      .map(|(server_id, game)| format_game_catalog_entry(&server_id, &game, query.include_voting))
-      .collect(),
-  )
+  let mut entries = games
+    .into_iter()
+    .map(|(server_id, game)| {
+      let mut row = format_game_catalog_entry(
+        &server_id,
+        &game,
+        query.include_voting || query.include_external,
+      );
+      if query.include_external {
+        row.pop();
+        row.push_str("\t\t\n");
+      }
+      (game.order, game.id.to_lowercase(), row)
+    })
+    .collect::<Vec<_>>();
+  if query.include_external {
+    let external = state
+      .config
+      .external_servers()
+      .await
+      .map_err(crate::layout::LayoutError::from)
+      .map_err(ManagerError::from)?;
+    for (server_id, destination) in external {
+      let game = &destination.gamevoting;
+      let mut row = format_game_catalog_entry(&server_id, game, true);
+      row.pop();
+      row.push_str(&format!(
+        "\t{}\t{}\n",
+        encode_game_field(&destination.address.to_string()),
+        encode_game_field(&destination.minecraft_version)
+      ));
+      entries.push((game.order, game.id.to_lowercase(), row));
+    }
+  }
+  entries.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+  Ok(entries.into_iter().map(|(_, _, row)| row).collect())
 }
 
 async fn bridge_game_details(State(state): State<ApiState>) -> Result<String, ApiError> {
@@ -534,6 +393,18 @@ async fn bridge_game_details(State(state): State<ApiState>) -> Result<String, Ap
       .map(|(server_id, game)| format_game_details_entry(&server_id, &game))
       .collect(),
   )
+}
+
+async fn bridge_join_external(
+  State(state): State<ApiState>,
+  Path(server_id): Path<String>,
+  Form(form): Form<PlayerListForm>,
+) -> Result<StatusCode, ApiError> {
+  state
+    .manager
+    .join_external(&server_id, parse_uuid_list(&form.players)?)
+    .await?;
+  Ok(StatusCode::NO_CONTENT)
 }
 
 async fn bridge_solo_access(State(state): State<ApiState>) -> Result<String, ApiError> {
@@ -970,6 +841,205 @@ impl IntoResponse for ApiError {
 mod tests {
   use super::*;
 
+  async fn test_state() -> (tempfile::TempDir, ApiState) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    tokio::fs::create_dir(root.join("servers")).await.unwrap();
+    tokio::fs::write(
+      root.join("servers/external-servers.json"),
+      include_str!("../tests/fixtures/external-survival.json"),
+    )
+    .await
+    .unwrap();
+    let config = Arc::new(LoadedConfig {
+      file: root.join("config.json"),
+      root: root.to_path_buf(),
+      value: serde_json::from_value(serde_json::json!({
+        "api": {"port": 25566, "token": "01234567890123456789012345678901"},
+        "bridge": {"token": "11234567890123456789012345678901"},
+        "postgresql": {"home": "postgres", "host": "127.0.0.1", "port": 5432,
+                       "username": "test", "password": "test"},
+        "ports": {"velocity": 25565, "start": 50000, "end": 51000},
+        "java": {"21_home": "java21", "25_home": "java25"},
+        "paths": {"cores": "cores", "plugins": "plugins", "mods": "mods",
+                  "servers": "servers", "worlds": "worlds", "runtime": "runtime",
+                  "logs": "logs", "pid_file": "scheduler.pid", "scheduler_log": "scheduler.log"}
+      }))
+      .unwrap(),
+    });
+    let state = ApiState {
+      manager: InstanceManager::new(config.clone()),
+      config: config.clone(),
+      shutdown: broadcast::channel(1).0,
+    };
+    (directory, state)
+  }
+
+  #[tokio::test]
+  async fn removed_web_endpoints_return_not_found_while_player_tracking_still_works() {
+    let (_directory, state) = test_state().await;
+    let token = state.config.value.bridge.token.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+    let client = reqwest::Client::new();
+    for path in ["/bridge/v1/sync", "/bridge/v1/leaderboards"] {
+      let response = client
+        .post(format!("http://{address}{path}"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"game": "bingo"}))
+        .send()
+        .await
+        .unwrap();
+      assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    let snapshot = "00000000-0000-0000-0000-000000000001\tAlex\t42\tLobby";
+    let response = client
+      .post(format!("http://{address}/bridge/v1/players"))
+      .bearer_auth(&token)
+      .form(&[("players", snapshot)])
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let players = client
+      .get(format!("http://{address}/bridge/v1/players"))
+      .bearer_auth(&token)
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(players.status(), StatusCode::OK);
+    assert_eq!(players.text().await.unwrap().trim_end(), snapshot);
+    server.abort();
+  }
+
+  #[tokio::test]
+  async fn legacy_web_configuration_is_ignored_when_loading_config() {
+    let (directory, state) = test_state().await;
+    let mut value = serde_json::to_value(&state.config.value).unwrap();
+    value["public-database"] = serde_json::json!({
+      "enabled": true, "url": "invalid-and-unreachable", "publish_interval_seconds": 0
+    });
+    let file = directory.path().join("config.json");
+    tokio::fs::write(&file, serde_json::to_vec(&value).unwrap())
+      .await
+      .unwrap();
+    let config = LoadedConfig::load(&file).await.unwrap();
+    assert!(
+      serde_json::to_value(config.value)
+        .unwrap()
+        .get("public-database")
+        .is_none()
+    );
+  }
+
+  #[tokio::test]
+  async fn external_survival_is_in_catalog_without_starting_or_probing_backend() {
+    let (directory, state) = test_state().await;
+    let root = directory.path();
+    let config = state.config.clone();
+    let legacy = bridge_games(State(state.clone()), Query(GameCatalogQuery::default()))
+      .await
+      .unwrap();
+    assert!(legacy.is_empty());
+    let catalog = bridge_games(
+      State(state),
+      Query(GameCatalogQuery {
+        include_voting: true,
+        include_external: true,
+      }),
+    )
+    .await
+    .unwrap();
+    let fields = catalog
+      .trim_end_matches('\n')
+      .split('\t')
+      .collect::<Vec<_>>();
+    assert_eq!(fields.len(), 20);
+    assert_eq!(fields[0], "1");
+    for (index, expected) in [
+      (1, "survival"),
+      (2, "survival"),
+      (3, "&a&l生存服务器"),
+      (4, "&7点击进入生存服务器"),
+      (5, "GRASS_BLOCK"),
+      (7, "26.2"),
+      (13, "shared"),
+      (18, "10.19.72.18:25565"),
+      (19, "26.2"),
+    ] {
+      assert_eq!(
+        STANDARD_NO_PAD.decode(fields[index]).unwrap(),
+        expected.as_bytes()
+      );
+    }
+    assert_eq!(fields[12], "true");
+    assert_eq!(fields[17], "false");
+    assert!(!root.join("runtime").exists());
+
+    // Nix relocates the generated config while making paths.servers absolute.
+    // Neither an old root catalog nor a database-side catalog should be consulted.
+    tokio::fs::create_dir(root.join("database")).await.unwrap();
+    tokio::fs::write(root.join("external-servers.json"), "invalid old file")
+      .await
+      .unwrap();
+    tokio::fs::write(
+      root.join("database/external-servers.json"),
+      "invalid old file",
+    )
+    .await
+    .unwrap();
+    let mut runtime_value = config.value.clone();
+    runtime_value.paths.servers = root.join("servers");
+    let runtime_file = root.join("database/runtime-config.json");
+    tokio::fs::write(&runtime_file, serde_json::to_vec(&runtime_value).unwrap())
+      .await
+      .unwrap();
+    let runtime_config = LoadedConfig::load(&runtime_file).await.unwrap();
+    assert_eq!(
+      runtime_config.external_servers_file(),
+      config.external_servers_file()
+    );
+    assert!(runtime_config.server_ids().await.unwrap().is_empty());
+    assert!(runtime_config.server_file("external-servers").is_err());
+    assert!(runtime_config.server_file("EXTERNAL-SERVERS").is_err());
+
+    let mut external: serde_json::Value =
+      serde_json::from_str(include_str!("../tests/fixtures/external-survival.json")).unwrap();
+    let mut second = external["survival"].clone();
+    second["gamevoting"]["id"] = "second".into();
+    second["address"] = "10.19.72.19:25565".into();
+    external["second"] = second;
+    tokio::fs::write(
+      runtime_config.external_servers_file(),
+      serde_json::to_vec(&external).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(runtime_config.external_servers().await.unwrap().len(), 2);
+
+    // The directory name is configured; a singular server/ works too.
+    tokio::fs::rename(root.join("servers"), root.join("server"))
+      .await
+      .unwrap();
+    runtime_value.paths.servers = root.join("server");
+    tokio::fs::write(&runtime_file, serde_json::to_vec(&runtime_value).unwrap())
+      .await
+      .unwrap();
+    let runtime_config = LoadedConfig::load(&runtime_file).await.unwrap();
+    assert_eq!(runtime_config.external_servers().await.unwrap().len(), 2);
+    assert!(runtime_config.server_ids().await.unwrap().is_empty());
+    tokio::fs::write(root.join("server/external-servers.json"), "invalid")
+      .await
+      .unwrap();
+    assert!(runtime_config.external_servers().await.is_err());
+    assert!(runtime_config.server_ids().await.unwrap().is_empty());
+    tokio::fs::remove_file(runtime_config.external_servers_file())
+      .await
+      .unwrap();
+    assert!(runtime_config.external_servers().await.unwrap().is_empty());
+  }
+
   #[test]
   fn process_completion_failures_are_internal_server_errors() {
     let error = ApiError::from(ManagerError::Completion("disk write failed".into()));
@@ -981,37 +1051,6 @@ mod tests {
     let mut headers = HeaderMap::new();
     headers.insert(AUTHORIZATION, "Basic test".parse().unwrap());
     assert!(!valid_bearer(&headers, "01234567890123456789012345678901"));
-  }
-
-  #[test]
-  fn leaderboard_validation_normalizes_all_time_and_rejects_non_positive_duration() {
-    let mut entry = LeaderboardEntryRequest {
-      game: " Bingo ".into(),
-      metric: "NORMAL".into(),
-      period: LeaderboardPeriod::AllTime,
-      period_key: Some("2026-07".into()),
-      player_id: " player-one ".into(),
-      username: " Alex ".into(),
-      player_uuid: uuid::Uuid::nil(),
-      score: 42,
-      updated_at: chrono::Utc::now(),
-    };
-    validate_leaderboard_entry(&mut entry).unwrap();
-    assert_eq!(entry.game, "bingo");
-    assert_eq!(entry.metric, "normal");
-    assert_eq!(entry.period_key, None);
-    assert_eq!(entry.player_id, "player-one");
-
-    entry.score = 0;
-    assert!(validate_leaderboard_entry(&mut entry).is_err());
-  }
-
-  #[test]
-  fn leaderboard_month_requires_calendar_month_key() {
-    assert!(valid_month_key("2026-07"));
-    assert!(!valid_month_key("2026-00"));
-    assert!(!valid_month_key("2026-13"));
-    assert!(!valid_month_key("26-07"));
   }
 
   #[test]
@@ -1139,40 +1178,5 @@ mod tests {
   fn rejects_invalid_player_snapshot() {
     let error = parse_players("invalid\tAlex\t42\tlobby").unwrap_err();
     assert_eq!(error.status, StatusCode::BAD_REQUEST);
-  }
-
-  #[test]
-  fn sync_targets_only_ready_bingo_instances() {
-    let bingo_servers = BTreeSet::from(["Bingo".to_string()]);
-    let bingo_backends = BTreeSet::from(["Bingo-solo-owner".to_string()]);
-    let instances = vec![
-      sync_instance("Bingo", crate::protocol::InstanceState::Ready),
-      sync_instance("Bingo-solo-owner", crate::protocol::InstanceState::Ready),
-      sync_instance("Bingo-starting", crate::protocol::InstanceState::Starting),
-      sync_instance("Lobby", crate::protocol::InstanceState::Ready),
-    ];
-
-    assert_eq!(
-      ready_bingo_instances(instances, &bingo_servers, &bingo_backends),
-      ["Bingo", "Bingo-solo-owner"]
-    );
-  }
-
-  fn sync_instance(
-    server_id: &str,
-    state: crate::protocol::InstanceState,
-  ) -> crate::protocol::InstanceInfo {
-    crate::protocol::InstanceInfo {
-      server_id: server_id.to_string(),
-      instance_id: uuid::Uuid::new_v4(),
-      state,
-      pid: 1,
-      port: 25565,
-      work_dir: std::path::PathBuf::new(),
-      log_file: std::path::PathBuf::new(),
-      started_at: 0,
-      last_heartbeat: None,
-      exit_code: None,
-    }
   }
 }

@@ -7,6 +7,34 @@
 Scheduler 自身以后台进程运行，不提供持续交互式控制台。服务端命令、日志和实例
 状态通过 CLI 或 HTTP API 访问。
 
+服务重启一旦提交，由 Scheduler 独立完成停服、清理和重新启动；即使发起请求的
+Velocity 自身退出、HTTP 连接断开或客户端超时，重启仍继续执行。相同服务器的并发
+启动/重启会被拒绝，避免重复进程；Scheduler 整体关闭时不会再为未完成的重启拉起替代进程。
+
+## 实现结构
+
+部署根目录为 `shtechcraft-minigames/`，调度器源码位于相邻的 `server-scheduler/`，
+跨平台游戏插件位于 `scheduler-bridge/`。玩家先连接 Velocity，进入常驻 Lobby；
+大厅投票、Solo 入口或管理命令经 Bridge 请求 Scheduler，目标实例 READY 后由
+Velocity 注册后端并执行传送。外部服务器只作为固定目标注册和传送，不由 Scheduler
+启动或保存世界。
+
+| 模块 | 职责 |
+| --- | --- |
+| `main.rs` / `client.rs` | 后台进程、CLI、启动停止、回环 HTTP 客户端 |
+| `config.rs` / `layout.rs` | 服务器目录、Java 与版本选择、临时实例组装、配置渲染 |
+| `manager.rs` | 进程和端口管理、READY/心跳、自动启动、空服关闭、维护、玩家与传送队列 |
+| `solo.rs` / `world_store.rs` | Solo 冻结名单、存档过期清理、持久世界保存与中断恢复 |
+| `dependency_cache.rs` / `runtime.rs` | 依赖内容寻址缓存、运行目录暂存与清理 |
+| `api.rs` / `protocol.rs` | 独立 Admin/Bridge Token、管理 API 与游戏内通信协议 |
+| `network.rs` | 可选 FRPC 子进程与异常重启 |
+
+服务器定义、世界存档和依赖缓存保存在本机文件系统；当前实例、在线玩家和传送队列
+由 Scheduler 内存维护。本地 PostgreSQL 的连接参数由 Scheduler 渲染给游戏插件，
+用于 LuckPerms、Bingo Stats、成就等业务。Scheduler 自身已不再使用 SQL 客户端。
+独立的 `scheduler-web/` 仍是读取旧 `scheduler_*` 表的 Next.js 项目；此版本不再为它
+生产数据，历史表保留在原数据库中。
+
 ## 构建
 
 需要 Rust 工具链：
@@ -47,11 +75,6 @@ cargo build --release --locked
     "username": "minigames",
     "password": "replace-with-a-strong-password"
   },
-  "public-database": {
-    "enabled": false,
-    "url": "postgresql://scheduler:password@public-db.example.com:5432/scheduler_web?sslmode=require",
-    "publish_interval_seconds": 5
-  },
   "ports": {
     "velocity": 25565,
     "start": 50001,
@@ -83,27 +106,11 @@ cargo build --release --locked
 `api.token` 与 `bridge.token` 都必须至少包含 32 个字符。PostgreSQL 主目录、连接
 参数以及 Java 21、Java 25 的 Home 均由此文件统一配置。
 
-`public-database.enabled` 默认为 `false`。启用后必须提供公网 PostgreSQL URL；Scheduler
-会在启动时建表，并按 `publish_interval_seconds` 将服务器定义、运行实例和玩家位置作为
-一个事务快照发布。连接或初次发布失败时 Scheduler 会拒绝启动，避免 Web 长期展示过期
-数据；运行期间的短暂同步失败会记录错误并在下一周期重试。Scheduler 停止时会清空实例
-和在线玩家表，但保留服务器目录与排行榜数据。
-
-Scheduler 与 `scheduler-web` 不直接调用彼此的 HTTP API，唯一共享边界是以下四张表：
-
-- `scheduler_server_definitions`：可配置服务器及公开游戏目录信息。
-- `scheduler_server_instances`：当前启动的实例、状态、端口、心跳和在线人数。
-- `scheduler_players`：当前在线玩家、延迟及所在服务器。
-- `scheduler_leaderboard_entries`：结构化排行榜读模型。Bingo Stats Mod 通过受 Bridge
-  Token 保护的 `POST /bridge/v1/leaderboards` 提交月榜与总榜完成用时，Scheduler
-  校验后写入；Web 只读此表。Bingo 的 `score` 单位为毫秒，数值越小排名越高。
-
-Velocity 管理员可以执行 `/network sync`。该命令调用受 Bridge Token 保护的
-`POST /bridge/v1/sync`：Scheduler 先立即发布服务器定义、实例和玩家完整快照，再向
-所有 READY Bingo 实例发送 `bingo_stats sync`，等待并逐实例汇报排行榜同步触发结果。
-
-公网数据库账号应只授予这四张表及其索引所需权限。Web 后端应使用单独的只读账号，
-并通过环境变量注入连接 URL，不应复用 Scheduler 的写入账号。
+Scheduler 已移除面向 `scheduler-web` 的公网数据库发布与排行榜上传功能：不再连接、
+建表或写入 Web 数据库，`POST /bridge/v1/leaderboards`、`POST /bridge/v1/sync` 和
+Velocity 的 `/network sync` 已删除。旧配置中的 `public-database` 会被忽略，升级不会
+连接或删除其中指定的数据库。游戏插件使用的本地 PostgreSQL 配置与 Bridge 的玩家
+状态上报、目录轮询和传送功能继续保留。
 
 Velocity 使用 `ports.velocity` 的固定入口端口。普通子服务器从 `ports.start` 开始
 选择第一个未被当前 Scheduler 实例、宿主机其他进程或端口复用冷却占用的端口。子服
@@ -578,3 +585,21 @@ Velocity 应先匹配当前实例 UUID；`open` 允许任意玩家进入，`rost
 - 为管理 API、Bridge 和 PostgreSQL 配置不同的强密码或 Token。
 - `config.json` 包含敏感数据，应限制文件权限和仓库可见性。
 - `.runtime/`、`logs/`、PID、运行日志和构建产物不应提交到版本库。
+
+## 固定地址外服
+
+可在 `paths.servers` 指定的服务器定义目录内增加 `external-servers.json`，把固定地址和真实 Minecraft
+版本的独立外服接入单人游戏目录。示例见 [examples/external-servers.json](examples/external-servers.json)。
+此文件聚合所有外服，托管服务器扫描会跳过它；外服不参与 runtime、世界保存、进程生命周期或 network 管控。
+目录可以是 `server/` 或 `servers/`，以配置为准。Nix 生成主配置后仍沿用该目录；新版不再读取主配置旁的旧外服文件。
+
+新版 Bridge 使用 `GET /bridge/v1/games?include_voting=true&include_external=true`，
+目录包含 20 列：前 18 列保持原义，最后两列是 Base64 编码的外服地址和真实版本。
+受管游戏最后两列为空；旧查询不返回外服条目。点击入口调用
+`POST /bridge/v1/external-servers/<server-id>/join`，表单 `players=<单个在线玩家 UUID>`，
+成功返回 204 并排队直接传送，不启动实例。
+
+完整的远程更新、MUA UUID 保留、`/hub`、`/ping`、Xaero 按子服隔离及旧地图迁移步骤见
+[远程外服接入指南](docs/EXTERNAL_SERVERS.md)。
+
+面向玩家的分步操作见 [玩家迁移指南](docs/PLAYER_MIGRATION_GUIDE.md)，涵盖不同实例目录、已有大厅数据的保留、Xaero 路标转移、Voxy 缓存及备份恢复。

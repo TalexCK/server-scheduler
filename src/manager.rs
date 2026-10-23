@@ -1387,6 +1387,16 @@ impl InstanceManager {
   }
 
   pub async fn restart(&self, server_id: &str) -> Result<InstanceInfo, ManagerError> {
+    // Restarting the proxy can disconnect the caller. Keep the reservation and
+    // stop/start sequence alive even if the HTTP handler stops waiting for it.
+    let manager = self.clone();
+    let server_id = server_id.to_string();
+    tokio::spawn(async move { manager.restart_operation(&server_id).await })
+      .await
+      .map_err(|error| ManagerError::Completion(format!("restart task failed: {error}")))?
+  }
+
+  async fn restart_operation(&self, server_id: &str) -> Result<InstanceInfo, ManagerError> {
     {
       let mut launching = self.launching.lock().await;
       if launching.contains(server_id) {
@@ -1462,6 +1472,11 @@ impl InstanceManager {
         ));
       }
       spec.solo_session_id = None;
+    }
+    if self.shutting_down.load(Ordering::Acquire) {
+      return Err(ManagerError::State(
+        "scheduler is shutting down; restart cancelled".into(),
+      ));
     }
     self.launch_reserved(spec, Vec::new()).await
   }
@@ -1665,7 +1680,49 @@ impl InstanceManager {
     Ok(())
   }
 
+  pub async fn join_external(
+    &self,
+    server_id: &str,
+    players: Vec<Uuid>,
+  ) -> Result<(), ManagerError> {
+    let external = self
+      .config
+      .external_servers()
+      .await
+      .map_err(layout::LayoutError::from)?;
+    let (server_id, destination) = external
+      .iter()
+      .find(|(id, _)| id.eq_ignore_ascii_case(server_id))
+      .ok_or_else(|| ManagerError::NotFound(server_id.to_string()))?;
+    // This is a direct personal entry, not a party/session launch API.
+    if players.len() != 1 {
+      return Err(ManagerError::State(
+        "external join requires exactly one player".into(),
+      ));
+    }
+    self.ensure_solo_players_online(&players).await?;
+    self
+      .enqueue_address_transfers(
+        server_id,
+        destination.address.to_string(),
+        players.iter().map(Uuid::to_string).collect(),
+      )
+      .await;
+    Ok(())
+  }
+
   async fn enqueue_transfers(&self, server_id: &str, port: u16, players: Vec<String>) {
+    self
+      .enqueue_address_transfers(server_id, format!("127.0.0.1:{port}"), players)
+      .await;
+  }
+
+  async fn enqueue_address_transfers(
+    &self,
+    server_id: &str,
+    address: String,
+    players: Vec<String>,
+  ) {
     let mut transfers = self.transfers.lock().await;
     for player in players {
       if transfers
@@ -1682,7 +1739,7 @@ impl InstanceManager {
           transfer_id,
           server_id: server_id.to_string(),
           player,
-          address: format!("127.0.0.1:{port}"),
+          address: address.clone(),
           next_attempt: timestamp,
           expires_at: timestamp.saturating_add(self.config.value.bridge.transfer_timeout_seconds),
           attempts: 0,
@@ -1755,6 +1812,13 @@ impl InstanceManager {
         ready_servers.insert(info.server_id.clone());
       }
     }
+    let external = match self.config.external_servers().await {
+      Ok(destinations) => destinations,
+      Err(error) => {
+        tracing::warn!(%error, "External transfer catalog could not be loaded");
+        Default::default()
+      }
+    };
     let mut transfers = self.transfers.lock().await;
     transfers.retain(|_, transfer| {
       transfer_active(
@@ -1765,7 +1829,12 @@ impl InstanceManager {
     });
     let mut result = Vec::new();
     for transfer in transfers.values_mut() {
-      if transfer.next_attempt <= timestamp && ready_servers.contains(&transfer.server_id) {
+      let external_ready = external
+        .get(&transfer.server_id)
+        .is_some_and(|destination| destination.address.to_string() == transfer.address);
+      if transfer.next_attempt <= timestamp
+        && (ready_servers.contains(&transfer.server_id) || external_ready)
+      {
         transfer.attempts += 1;
         transfer.next_attempt = timestamp + retry;
         result.push(PendingTransfer {
@@ -2119,10 +2188,6 @@ fn create_process_command(config: &LoadedConfig, prepared: &PreparedInstance) ->
       format!("http://127.0.0.1:{}", config.value.api.port),
     )
     .env("SCHEDULER_BRIDGE_TOKEN", &config.value.bridge.token)
-    .env(
-      "SCHEDULER_LEADERBOARD_ENABLED",
-      config.value.public_database.enabled.to_string(),
-    )
     .env("SCHEDULER_SERVER_ID", &prepared.server_id)
     .env("SCHEDULER_INSTANCE_ID", prepared.instance_id.to_string())
     .env("SCHEDULER_SERVER_PORT", prepared.port.to_string())
@@ -2371,6 +2436,9 @@ async fn supervise(
     Instant::now(),
   )
   .await;
+  // A waiter may launch the replacement as soon as completion is sent. Release
+  // the world writer lease first so a completed stop never leaves it occupied.
+  drop(context._persistent_world_lease);
   let mut mutable = context.info.write().await;
   match status {
     Ok(exit) => {
@@ -2782,6 +2850,61 @@ mod tests {
     manager.probe_ports = false;
     manager.initialize().await.unwrap();
     (directory, manager)
+  }
+
+  #[tokio::test]
+  async fn external_join_preserves_uuid_and_never_creates_managed_state() {
+    let (directory, manager) = solo_test_manager(SoloMode::Shared, SoloStartup::OnDemand).await;
+    let path = directory.path().join("servers/external-servers.json");
+    let definition = serde_json::json!({"survival": {
+      "address":"survival.talexck.com:25565", "minecraft_version":"26.2",
+      "gamevoting":{"id":"external-survival","name":"Survival","material":"GRASS_BLOCK"}
+    }});
+    fs::write(&path, serde_json::to_vec(&definition).unwrap())
+      .await
+      .unwrap();
+    let player = Uuid::new_v4();
+    manager.replace_players(vec![presence(player)]).await;
+    manager
+      .join_external("SURVIVAL", vec![player])
+      .await
+      .unwrap();
+    manager
+      .join_external("survival", vec![player])
+      .await
+      .unwrap();
+    let transfers = manager.pending_transfers().await;
+    assert_eq!(transfers.len(), 1);
+    assert_eq!(transfers[0].player, player.to_string());
+    assert_eq!(transfers[0].address, "survival.talexck.com:25565");
+    assert_eq!(transfers[0].server_id, "survival");
+    assert!(manager.list().await.is_empty());
+    assert!(manager.allocated_ports.lock().await.is_empty());
+    assert!(manager.config.load_server("survival").await.is_err());
+    assert!(manager.stop("survival").await.is_err());
+    assert!(!directory.path().join(".runtime/survival").exists());
+    assert!(manager.join_external("survival", vec![]).await.is_err());
+    assert!(
+      manager
+        .join_external("survival", vec![player, Uuid::new_v4()])
+        .await
+        .is_err()
+    );
+    fs::write(&path, b"{}").await.unwrap();
+    assert!(manager.pending_transfers().await.is_empty());
+    assert!(
+      manager
+        .join_external("survival", vec![player])
+        .await
+        .is_err()
+    );
+    let mut conflicting = definition;
+    conflicting["game"] = conflicting["survival"].take();
+    conflicting.as_object_mut().unwrap().remove("survival");
+    fs::write(&path, serde_json::to_vec(&conflicting).unwrap())
+      .await
+      .unwrap();
+    assert!(manager.config.external_servers().await.is_err());
   }
 
   fn presence(player: Uuid) -> PlayerPresence {
@@ -3809,6 +3932,137 @@ mod tests {
     assert!(manager.solo_sessions.read().await.is_empty());
   }
 
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn autostart_restart_creates_one_replacement_process() {
+    let (directory, manager) = solo_test_manager(SoloMode::Shared, SoloStartup::OnDemand).await;
+    let file = directory.path().join("servers/game.json");
+    let mut definition: serde_json::Value =
+      serde_json::from_slice(&fs::read(&file).await.unwrap()).unwrap();
+    definition.as_object_mut().unwrap().remove("gamevoting");
+    definition["autostart"] = true.into();
+    definition["world"] = serde_json::json!({"mode": "persistent", "id": "puzzle"});
+    fs::write(file, serde_json::to_vec(&definition).unwrap())
+      .await
+      .unwrap();
+    manager.ensure_autostart().await;
+    let original = manager.instance("game").await.unwrap();
+    let initial = original.info.read().await.clone();
+    manager.ready("game", initial.instance_id).await.unwrap();
+    let polling = manager.clone();
+    let monitor = tokio::spawn(async move {
+      for _ in 0..20 {
+        polling.ensure_autostart().await;
+        sleep(Duration::from_millis(1)).await;
+      }
+    });
+    let replacement = timeout(Duration::from_secs(5), manager.restart("game"))
+      .await
+      .unwrap()
+      .unwrap();
+    monitor.await.unwrap();
+    assert_ne!(replacement.instance_id, initial.instance_id);
+    assert_ne!(replacement.pid, initial.pid);
+    assert_eq!(replacement.state, InstanceState::Starting);
+    assert_eq!(original.info.read().await.state, InstanceState::Exited);
+    assert!(!initial.work_dir.exists());
+    assert_eq!(manager.allocated_ports.lock().await.len(), 1);
+    assert!(!manager.launching.lock().await.contains("game"));
+    manager.stop_all().await;
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn required_server_restart_does_not_relaunch_during_shutdown() {
+    let (_directory, manager) = solo_test_manager(SoloMode::Shared, SoloStartup::Always).await;
+    manager.ensure_autostart().await;
+    let original = manager.instance("game").await.unwrap();
+    let initial = original.info.read().await.clone();
+    let cleanup = manager.dependency_cache_lock.lock().await;
+    let restart_manager = manager.clone();
+    let caller = tokio::spawn(async move { restart_manager.restart("game").await });
+    timeout(Duration::from_secs(5), async {
+      while original.info.read().await.state != InstanceState::Stopping {
+        sleep(Duration::from_millis(10)).await;
+      }
+    })
+    .await
+    .unwrap();
+    manager.shutting_down.store(true, Ordering::Release);
+    drop(cleanup);
+    assert!(
+      timeout(Duration::from_secs(5), caller)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err()
+    );
+    assert_eq!(
+      manager
+        .instance("game")
+        .await
+        .unwrap()
+        .info
+        .read()
+        .await
+        .instance_id,
+      initial.instance_id
+    );
+    assert!(!manager.launching.lock().await.contains("game"));
+    assert!(manager.allocated_ports.lock().await.is_empty());
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn required_server_restart_survives_caller_cancellation() {
+    let (_directory, manager) = solo_test_manager(SoloMode::Shared, SoloStartup::Always).await;
+    manager.ensure_autostart().await;
+    let original = manager.instance("game").await.unwrap();
+    let initial = original.info.read().await.clone();
+    // Hold cleanup so the caller can disconnect after stopping the old process.
+    let cleanup = manager.dependency_cache_lock.lock().await;
+    let restart_manager = manager.clone();
+    let caller = tokio::spawn(async move { restart_manager.restart("game").await });
+    timeout(Duration::from_secs(5), async {
+      while original.info.read().await.state != InstanceState::Stopping {
+        sleep(Duration::from_millis(10)).await;
+      }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+      manager.restart("game").await,
+      Err(ManagerError::AlreadyRunning(_))
+    ));
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    drop(cleanup);
+    timeout(Duration::from_secs(5), async {
+      loop {
+        manager.ensure_autostart().await;
+        let info = manager
+          .instance("game")
+          .await
+          .unwrap()
+          .info
+          .read()
+          .await
+          .clone();
+        if info.instance_id != initial.instance_id
+          && info.state.active()
+          && !manager.launching.lock().await.contains("game")
+        {
+          break;
+        }
+        sleep(Duration::from_millis(10)).await;
+      }
+    })
+    .await
+    .expect("required server was left stopped after restart caller disconnected");
+    assert!(!manager.launching.lock().await.contains("game"));
+    manager.stop_all().await;
+  }
+
   #[test]
   fn dynamic_port_allocation_reports_exhaustion() {
     let allocated = HashSet::from([50001, 50002]);
@@ -4214,9 +4468,12 @@ mod tests {
     let prepared = layout::prepare(&config, "game", port).await.unwrap();
     let log_buffer = open_instance_log(&prepared).await.unwrap();
     let mut command = create_process_command(&config, &prepared);
-    assert!(command.as_std().get_envs().any(|(key, value)| {
-      key == "SCHEDULER_LEADERBOARD_ENABLED" && value == Some(std::ffi::OsStr::new("false"))
-    }));
+    assert!(
+      !command
+        .as_std()
+        .get_envs()
+        .any(|(key, _)| { key == "SCHEDULER_LEADERBOARD_ENABLED" })
+    );
     let mut child = spawn_instance_process(&mut command, &prepared)
       .await
       .unwrap();

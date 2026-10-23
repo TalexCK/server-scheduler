@@ -1,0 +1,18 @@
+{
+  "survival": {
+    "address": "10.19.72.18:25565",
+    "minecraft_version": "26.2",
+    "gamevoting": {
+      "order": 1,
+      "id": "survival",
+      "name": "&a&l生存服务器",
+      "description": ["&7点击进入生存服务器"],
+      "material": "GRASS_BLOCK",
+      "min_players": 1,
+      "max_players": 50,
+      "solo": true,
+      "voting": false,
+      "solo_mode": "shared"
+    }
+  }
+}

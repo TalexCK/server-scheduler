@@ -8,6 +8,8 @@ use thiserror::Error;
 use tokio::fs;
 
 const DISALLOWED_JVM_OPTION_PREFIXES: [&str; 2] = ["-Dusing.aikars.flags=", "-Daikars.new.flags="];
+const EXTERNAL_SERVERS_ID: &str = "external-servers";
+const EXTERNAL_SERVERS_FILE: &str = "external-servers.json";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum JavaVersion {
@@ -22,8 +24,6 @@ pub struct SchedulerConfig {
   pub api: ApiConfig,
   pub bridge: BridgeConfig,
   pub postgresql: PostgresConfig,
-  #[serde(default, rename = "public-database")]
-  pub public_database: PublicDatabaseConfig,
   pub ports: PortConfig,
   #[serde(default, rename = "enable-frpc")]
   pub enable_frpc: bool,
@@ -59,26 +59,6 @@ pub struct PostgresConfig {
   pub port: u16,
   pub username: String,
   pub password: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PublicDatabaseConfig {
-  #[serde(default)]
-  pub enabled: bool,
-  #[serde(default)]
-  pub url: String,
-  #[serde(default = "default_public_database_publish_interval")]
-  pub publish_interval_seconds: u64,
-}
-
-impl Default for PublicDatabaseConfig {
-  fn default() -> Self {
-    Self {
-      enabled: false,
-      url: String::new(),
-      publish_interval_seconds: default_public_database_publish_interval(),
-    }
-  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +140,11 @@ impl LoadedConfig {
 
   pub fn server_file(&self, id: &str) -> Result<PathBuf, ConfigError> {
     validate_id(id)?;
+    if id.eq_ignore_ascii_case(EXTERNAL_SERVERS_ID) {
+      return Err(ConfigError::Validation(
+        "external-servers is a catalog file, not a managed server ID".into(),
+      ));
+    }
     Ok(
       self
         .resolve(&self.value.paths.servers)
@@ -213,12 +198,67 @@ impl LoadedConfig {
         continue;
       }
       if let Some(id) = path.file_stem().and_then(|value| value.to_str()) {
+        if id.eq_ignore_ascii_case(EXTERNAL_SERVERS_ID) {
+          continue;
+        }
         validate_id(id)?;
         ids.push(id.to_string());
       }
     }
     ids.sort();
     Ok(ids)
+  }
+
+  pub fn external_servers_file(&self) -> PathBuf {
+    self
+      .resolve(&self.value.paths.servers)
+      .join(EXTERNAL_SERVERS_FILE)
+  }
+
+  /// The aggregate file shares the managed definitions directory but has no lifecycle.
+  pub async fn external_servers(
+    &self,
+  ) -> Result<BTreeMap<String, ExternalServerDefinition>, ConfigError> {
+    let path = self.external_servers_file();
+    let bytes = match fs::read(&path).await {
+      Ok(bytes) => bytes,
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+      Err(source) => return Err(ConfigError::Read { path, source }),
+    };
+    let mut external: BTreeMap<String, ExternalServerDefinition> =
+      serde_json::from_slice(&bytes).map_err(|source| ConfigError::Parse { path, source })?;
+    let managed = self.server_ids().await?;
+    let mut server_ids = managed
+      .iter()
+      .map(|id| id.to_lowercase())
+      .collect::<BTreeSet<_>>();
+    let mut game_ids = self
+      .game_definitions()
+      .await?
+      .into_iter()
+      .map(|(_, game)| game.id.to_lowercase())
+      .collect::<BTreeSet<_>>();
+    for (id, destination) in &mut external {
+      validate_id(id)?;
+      if !server_ids.insert(id.to_lowercase())
+        || managed.iter().any(|managed| {
+          id.to_lowercase()
+            .starts_with(&format!("{}-solo-", managed.to_lowercase()))
+        })
+      {
+        return Err(ConfigError::Validation(format!(
+          "external server ID conflicts with a managed server: {id}"
+        )));
+      }
+      destination.normalize()?;
+      if !game_ids.insert(destination.gamevoting.id.to_lowercase()) {
+        return Err(ConfigError::Validation(format!(
+          "duplicate GameVoting game ID: {}",
+          destination.gamevoting.id
+        )));
+      }
+    }
+    Ok(external)
   }
 
   pub async fn game_definitions(&self) -> Result<Vec<(String, GameVotingDefinition)>, ConfigError> {
@@ -292,20 +332,6 @@ impl SchedulerConfig {
         "PostgreSQL password contains invalid characters".into(),
       ));
     }
-    if self.public_database.enabled {
-      if !self.public_database.url.starts_with("postgres://")
-        && !self.public_database.url.starts_with("postgresql://")
-      {
-        return Err(ConfigError::Validation(
-          "enabled public database requires a postgres:// or postgresql:// URL".into(),
-        ));
-      }
-      if self.public_database.publish_interval_seconds == 0 {
-        return Err(ConfigError::Validation(
-          "public database publish_interval_seconds must be greater than zero".into(),
-        ));
-      }
-    }
     if self.ports.velocity == 0 || self.ports.start == 0 || self.ports.end < self.ports.start {
       return Err(ConfigError::Validation(
         "server port allocation range is invalid".into(),
@@ -326,8 +352,77 @@ impl SchedulerConfig {
   }
 }
 
-fn default_public_database_publish_interval() -> u64 {
-  5
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalServerDefinition {
+  pub address: String,
+  pub minecraft_version: String,
+  pub gamevoting: GameVotingDefinition,
+}
+
+fn normalize_external_address(value: &str) -> Result<String, ConfigError> {
+  let invalid =
+    || ConfigError::Validation("external address must be a fixed host:port or [IPv6]:port".into());
+  let (host, port) = value.rsplit_once(':').ok_or_else(invalid)?;
+  let port: u16 = port.parse().map_err(|_| invalid())?;
+  if port == 0 {
+    return Err(invalid());
+  }
+  if host.starts_with('[') && host.ends_with(']') {
+    let ip: std::net::Ipv6Addr = host[1..host.len() - 1].parse().map_err(|_| invalid())?;
+    if ip.is_unspecified() || ip.is_multicast() {
+      return Err(invalid());
+    }
+    return Ok(format!("[{ip}]:{port}"));
+  }
+  if host.is_empty()
+    || host.len() > 253
+    || host.split('.').any(|label| {
+      label.is_empty()
+        || label.len() > 63
+        || label.starts_with('-')
+        || label.ends_with('-')
+        || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+  {
+    return Err(invalid());
+  }
+  if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+    if ip.is_unspecified() || ip.is_multicast() {
+      return Err(invalid());
+    }
+  }
+  Ok(format!("{}:{port}", host.to_ascii_lowercase()))
+}
+
+impl ExternalServerDefinition {
+  fn normalize(&mut self) -> Result<(), ConfigError> {
+    self.address = normalize_external_address(&self.address)?;
+    validate_version(&self.minecraft_version)?;
+    if self.minecraft_version.eq_ignore_ascii_case("any")
+      || !self
+        .minecraft_version
+        .starts_with(|c: char| c.is_ascii_digit())
+    {
+      return Err(ConfigError::Validation(
+        "external server requires an exact Minecraft version".into(),
+      ));
+    }
+    let game = &mut self.gamevoting;
+    if game.solo_mode != SoloMode::Shared || game.voting == Some(true) {
+      return Err(ConfigError::Validation(
+        "external servers support only the solo shared entry, without voting".into(),
+      ));
+    }
+    game.solo = true;
+    game.voting = Some(false);
+    game.solo_startup = SoloStartup::OnDemand;
+    game.solo_max_players = 1;
+    if game.version.is_none() && game.min_version.is_none() && game.max_version.is_none() {
+      game.version = Some(self.minecraft_version.clone());
+    }
+    game.validate()
+  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -947,23 +1042,41 @@ mod tests {
   use super::*;
 
   #[test]
-  fn public_database_is_disabled_by_default() {
-    let config: PublicDatabaseConfig = serde_json::from_value(serde_json::json!({})).unwrap();
-    assert!(!config.enabled);
-    assert!(config.url.is_empty());
-    assert_eq!(config.publish_interval_seconds, 5);
-  }
-
-  #[test]
-  fn public_database_parses_explicit_settings() {
-    let config: PublicDatabaseConfig = serde_json::from_value(serde_json::json!({
-      "enabled": true,
-      "url": "postgresql://scheduler:secret@db.example.com/scheduler",
-      "publish_interval_seconds": 15
+  fn external_addresses_and_catalog_are_validated_without_lifecycle_settings() {
+    for (input, expected) in [
+      ("Survival.Talexck.COM:25565", "survival.talexck.com:25565"),
+      ("127.0.0.1:25570", "127.0.0.1:25570"),
+      ("[2001:db8::1]:25565", "[2001:db8::1]:25565"),
+    ] {
+      assert_eq!(normalize_external_address(input).unwrap(), expected);
+    }
+    for invalid in [
+      "host",
+      "host:0",
+      "host:65536",
+      "https://host:25565",
+      "a b:1",
+      "[::]:1",
+      "::1:25565",
+      "0.0.0.0:1",
+    ] {
+      assert!(normalize_external_address(invalid).is_err(), "{invalid}");
+    }
+    let mut external: ExternalServerDefinition = serde_json::from_value(serde_json::json!({
+      "address":"survival.talexck.com:25565", "minecraft_version":"26.2",
+      "gamevoting":{"id":"external-survival","name":"Survival","material":"GRASS_BLOCK"}
     }))
     .unwrap();
-    assert!(config.enabled);
-    assert_eq!(config.publish_interval_seconds, 15);
+    external.normalize().unwrap();
+    assert!(external.gamevoting.solo);
+    assert!(!external.gamevoting.voting_enabled());
+    assert_eq!(external.gamevoting.version.as_deref(), Some("26.2"));
+    assert_eq!(external.gamevoting.solo_max_players, 1);
+    external.gamevoting.voting = Some(true);
+    assert!(external.normalize().is_err());
+    external.gamevoting.voting = Some(false);
+    external.gamevoting.solo_mode = SoloMode::PlayerWorld;
+    assert!(external.normalize().is_err());
   }
 
   #[test]

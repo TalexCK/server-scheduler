@@ -3,8 +3,6 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use chrono::{DateTime, Utc};
-
 use crate::config::{SoloMode, SoloStartup};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,37 +78,6 @@ pub struct IdleForm {
 pub struct PlayersForm {
   #[serde(default)]
   pub players: String,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LeaderboardPeriod {
-  Month,
-  AllTime,
-}
-
-impl LeaderboardPeriod {
-  pub const fn as_str(self) -> &'static str {
-    match self {
-      Self::Month => "month",
-      Self::AllTime => "all_time",
-    }
-  }
-}
-
-/// 由游戏统计模组提交给 Scheduler 的单条排行榜快照。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LeaderboardEntryRequest {
-  pub game: String,
-  pub metric: String,
-  pub period: LeaderboardPeriod,
-  #[serde(default)]
-  pub period_key: Option<String>,
-  pub player_id: String,
-  pub username: String,
-  pub player_uuid: Uuid,
-  pub score: i64,
-  pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
