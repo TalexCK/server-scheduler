@@ -89,6 +89,12 @@ pub struct PathsConfig {
   pub network: PathBuf,
   pub servers: PathBuf,
   pub worlds: PathBuf,
+  #[serde(default = "default_saves_path")]
+  pub saves: PathBuf,
+  #[serde(default = "default_resources_path")]
+  pub resources: PathBuf,
+  #[serde(default = "default_manifests_path")]
+  pub manifests: PathBuf,
   pub runtime: PathBuf,
   pub logs: PathBuf,
   pub pid_file: PathBuf,
@@ -100,6 +106,7 @@ pub struct LoadedConfig {
   pub file: PathBuf,
   pub root: PathBuf,
   pub value: SchedulerConfig,
+  pub(crate) generation: Option<PathBuf>,
 }
 
 impl LoadedConfig {
@@ -116,7 +123,33 @@ impl LoadedConfig {
       })?;
     let root = file.parent().unwrap_or(Path::new(".")).to_path_buf();
     value.validate()?;
-    Ok(Self { file, root, value })
+    Ok(Self {
+      file,
+      root,
+      value,
+      generation: None,
+    })
+  }
+
+  pub fn pinned(&self) -> Self {
+    let mut config = self.clone();
+    config.generation = crate::resources::active_root(self);
+    config
+  }
+
+  pub fn resource_root(&self, kind: &str) -> PathBuf {
+    if let Some(root) = crate::resources::active_root(self) {
+      return root.join(kind);
+    }
+    let path = match kind {
+      "cores" => &self.value.paths.cores,
+      "plugins" => &self.value.paths.plugins,
+      "mods" => &self.value.paths.mods,
+      "worlds" => &self.value.paths.worlds,
+      "servers" => &self.value.paths.servers,
+      _ => unreachable!(),
+    };
+    self.resolve(path)
   }
 
   pub fn resolve(&self, path: &Path) -> PathBuf {
@@ -145,11 +178,7 @@ impl LoadedConfig {
         "external-servers is a catalog file, not a managed server ID".into(),
       ));
     }
-    Ok(
-      self
-        .resolve(&self.value.paths.servers)
-        .join(format!("{id}.json")),
-    )
+    Ok(self.resource_root("servers").join(format!("{id}.json")))
   }
 
   pub async fn load_server(&self, id: &str) -> Result<ServerDefinition, ConfigError> {
@@ -168,7 +197,7 @@ impl LoadedConfig {
   }
 
   pub async fn server_ids(&self) -> Result<Vec<String>, ConfigError> {
-    let directory = self.resolve(&self.value.paths.servers);
+    let directory = self.resource_root("servers");
     let mut entries = fs::read_dir(&directory)
       .await
       .map_err(|source| ConfigError::Read {
@@ -210,9 +239,7 @@ impl LoadedConfig {
   }
 
   pub fn external_servers_file(&self) -> PathBuf {
-    self
-      .resolve(&self.value.paths.servers)
-      .join(EXTERNAL_SERVERS_FILE)
+    self.resource_root("servers").join(EXTERNAL_SERVERS_FILE)
   }
 
   /// The aggregate file shares the managed definitions directory but has no lifecycle.
@@ -262,10 +289,11 @@ impl LoadedConfig {
   }
 
   pub async fn game_definitions(&self) -> Result<Vec<(String, GameVotingDefinition)>, ConfigError> {
+    let pinned = self.pinned();
     let mut games = Vec::new();
     let mut game_ids = BTreeSet::new();
-    for server_id in self.server_ids().await? {
-      let definition = self.load_server(&server_id).await?;
+    for server_id in pinned.server_ids().await? {
+      let definition = pinned.load_server(&server_id).await?;
       let Some(game) = definition.gamevoting else {
         continue;
       };
@@ -921,7 +949,7 @@ pub fn validate_id(id: &str) -> Result<(), ConfigError> {
   Ok(())
 }
 
-fn validate_version(version: &str) -> Result<(), ConfigError> {
+pub(crate) fn validate_version(version: &str) -> Result<(), ConfigError> {
   if version.is_empty()
     || version == "."
     || version == ".."
@@ -1349,4 +1377,15 @@ mod tests {
     .unwrap();
     assert!(definition.validate().is_err());
   }
+}
+
+fn default_saves_path() -> PathBuf {
+  "saves".into()
+}
+fn default_resources_path() -> PathBuf {
+  ".resources".into()
+}
+
+fn default_manifests_path() -> PathBuf {
+  ".".into()
 }

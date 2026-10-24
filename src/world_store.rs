@@ -32,7 +32,10 @@ impl PersistentWorld {
     };
     Some(Self {
       id: id.clone(),
-      root: config.resolve(&config.value.paths.worlds).join(id),
+      root: config
+        .resolve(&config.value.paths.saves)
+        .join("shared")
+        .join(id),
       paths: paths.clone(),
     })
   }
@@ -526,7 +529,7 @@ mod tests {
   #[tokio::test]
   async fn persistent_world_round_trip_replaces_all_configured_worlds() {
     let directory = tempfile::tempdir().unwrap();
-    let root = directory.path().join("worlds/survival");
+    let root = directory.path().join("saves/shared/survival");
     for name in ["world", "world_nether", "world_the_end"] {
       fs::create_dir_all(root.join(name).join("region"))
         .await
@@ -577,7 +580,7 @@ mod tests {
   #[tokio::test]
   async fn missing_runtime_world_keeps_the_previous_saved_copy() {
     let directory = tempfile::tempdir().unwrap();
-    let root = directory.path().join("worlds/survival");
+    let root = directory.path().join("saves/shared/survival");
     fs::create_dir_all(root.join("world")).await.unwrap();
     fs::create_dir_all(root.join("world_nether")).await.unwrap();
     fs::write(root.join("world/level.dat"), b"old-main")
@@ -680,7 +683,7 @@ mod tests {
   #[tokio::test]
   async fn persist_failure_keeps_the_previous_world_package() {
     let directory = tempfile::tempdir().unwrap();
-    let root = directory.path().join("worlds/survival");
+    let root = directory.path().join("saves/shared/survival");
     fs::create_dir_all(root.join("world")).await.unwrap();
     fs::write(root.join("world/level.dat"), b"old")
       .await

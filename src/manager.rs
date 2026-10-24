@@ -34,7 +34,7 @@ use crate::{
     SoloSessionInfo, TransferResultStatus,
   },
   runtime,
-  solo::{self, SoloPersistence, SoloWorldMetadata},
+  solo::{self, SoloPersistence},
   world_store::{self, PersistentWorld},
 };
 
@@ -46,6 +46,7 @@ const SOLO_ONLINE_RETRY: Duration = Duration::from_millis(100);
 #[derive(Clone)]
 pub struct InstanceManager {
   config: Arc<LoadedConfig>,
+  pub resources: crate::resources::Updater,
   instances: Arc<RwLock<HashMap<String, Arc<InstanceControl>>>>,
   transfers: Arc<Mutex<HashMap<Uuid, TransferRecord>>>,
   players: Arc<RwLock<HashMap<Uuid, PlayerPresence>>>,
@@ -172,19 +173,6 @@ struct SoloSessionRecord {
   persistence: Option<SoloPersistence>,
 }
 
-impl SoloSessionRecord {
-  fn metadata(&self) -> SoloWorldMetadata {
-    SoloWorldMetadata {
-      game: self.game_id.clone(),
-      owner: self.owner,
-      players: self.players.clone(),
-      created: self.created,
-      updated: self.updated,
-      expires: self.expires.unwrap_or_default(),
-    }
-  }
-}
-
 #[derive(Debug, Clone)]
 struct SoloGame {
   server_id: String,
@@ -298,6 +286,7 @@ impl DailyRestartTracker {
 impl InstanceManager {
   pub fn new(config: Arc<LoadedConfig>) -> Self {
     Self {
+      resources: crate::resources::Updater::new(config.clone()),
       config,
       instances: Arc::new(RwLock::new(HashMap::new())),
       transfers: Arc::new(Mutex::new(HashMap::new())),
@@ -343,17 +332,20 @@ impl InstanceManager {
   pub async fn initialize(&self) -> Result<(), ManagerError> {
     let _operations = self.solo_operations.lock().await;
     let games = self.solo_games().await?;
-    let worlds_root = self.config.resolve(&self.config.value.paths.worlds);
+    let saves_root = self.config.resolve(&self.config.value.paths.saves);
     let mut sessions = HashMap::<String, SoloSessionRecord>::new();
     for game in games
       .into_iter()
       .filter(|game| game.definition.solo_mode == SoloMode::PlayerWorld)
     {
-      let roots = solo::game_session_roots(&worlds_root.join(&game.definition.id)).await?;
+      let roots = solo::player_session_roots(&saves_root, &game.definition.id).await?;
       for root in roots {
         let metadata = solo::read_metadata(&root).await?;
         if metadata.game != game.definition.id
-          || root.file_name().and_then(|value| value.to_str())
+          || root
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|value| value.to_str())
             != Some(metadata.owner.to_string().as_str())
           || !metadata.players.contains(&metadata.owner)
           || metadata
@@ -475,9 +467,24 @@ impl InstanceManager {
     }
     self.ensure_solo_players_online(&players).await?;
     let timestamp = now();
-    let (persistence, metadata) = solo::create_storage(
-      &self.config.resolve(&self.config.value.paths.worlds),
+    let template_id = match &self
+      .config
+      .load_server(&game.server_id)
+      .await
+      .map_err(layout::LayoutError::from)?
+      .world
+    {
+      crate::config::WorldDefinition::Template { id } => id.clone(),
+      _ => {
+        return Err(ManagerError::State(
+          "player world requires a template".into(),
+        ));
+      }
+    };
+    let (persistence, metadata) = solo::create_from_config(
+      &self.config.pinned(),
       &request.game_id,
+      &template_id,
       request.owner,
       players.clone(),
       game.definition.solo_retention_days,
@@ -630,7 +637,7 @@ impl InstanceManager {
       }
     }
     if let Some(persistence) = &record.persistence {
-      let mut metadata = record.metadata();
+      let mut metadata = solo::read_metadata(&persistence.root).await?;
       solo::touch(persistence, &mut metadata, now()).await?;
       if let Some(current) = self.solo_sessions.write().await.get_mut(&record.session_id) {
         current.updated = metadata.updated;
@@ -1052,19 +1059,19 @@ impl InstanceManager {
     spec: LaunchSpec,
     players: Vec<String>,
   ) -> Result<InstanceInfo, ManagerError> {
-    let definition = self
-      .config
+    let pinned = Arc::new(self.config.pinned());
+    let definition = pinned
       .load_server(&spec.definition_id)
       .await
       .map_err(layout::LayoutError::from)?;
     let planned_persistent = spec
       .persistence
       .is_none()
-      .then(|| PersistentWorld::from_definition(&self.config, &definition))
+      .then(|| PersistentWorld::from_definition(&pinned, &definition))
       .flatten();
     let persistent_world_lease = if let Some(persistent) = &planned_persistent {
       let lease = PersistentWorldLease::acquire(self.persistent_worlds.clone(), persistent)?;
-      if let Some(path) = world_store::pending_recovery(&self.config, &persistent.id).await? {
+      if let Some(path) = world_store::pending_recovery(&pinned, &persistent.id).await? {
         return Err(ManagerError::PersistentWorldRecovery {
           world_id: persistent.id.clone(),
           path,
@@ -1079,7 +1086,7 @@ impl InstanceManager {
 
     let prepared_result = if let Some(persistence) = &spec.persistence {
       layout::prepare_solo(
-        &self.config,
+        &pinned,
         &spec.definition_id,
         &spec.runtime_id,
         port,
@@ -1087,7 +1094,7 @@ impl InstanceManager {
       )
       .await
     } else {
-      layout::prepare_with_definition(&self.config, &spec.definition_id, port, definition).await
+      layout::prepare_with_definition(&pinned, &spec.definition_id, port, definition).await
     };
     let prepared = match prepared_result {
       Ok(prepared) => prepared,
@@ -1103,7 +1110,7 @@ impl InstanceManager {
         return Err(error);
       }
     };
-    let mut command = create_process_command(&self.config, &prepared);
+    let mut command = create_process_command(&pinned, &prepared);
     let mut child = match spawn_instance_process(&mut command, &prepared).await {
       Ok(child) => child,
       Err(error) => {
@@ -1215,7 +1222,7 @@ impl InstanceManager {
         stderr_task,
         allocated_ports: self.allocated_ports.clone(),
         port_cooldowns: self.port_cooldowns.clone(),
-        config: self.config.clone(),
+        config: pinned.clone(),
         runtime_id: prepared.server_id.clone(),
         dependency_id: spec.definition_id.clone(),
         work_dir: prepared.work_dir.clone(),
@@ -2825,6 +2832,7 @@ mod tests {
         },
         "idle_timeout_seconds": 300,
         "operator_players": operator_players,
+        "world": {"mode":"template", "id":"puzzle"},
         "gamevoting": {
           "id": "puzzle",
           "name": "Puzzle",
@@ -2842,6 +2850,15 @@ mod tests {
         }
       }))
       .unwrap(),
+    )
+    .await
+    .unwrap();
+    fs::create_dir_all(root.join("saves/shared/puzzle/world"))
+      .await
+      .unwrap();
+    fs::write(
+      root.join("saves/shared/puzzle/world/level.dat"),
+      b"template",
     )
     .await
     .unwrap();
@@ -2968,7 +2985,7 @@ mod tests {
     let reservations = Arc::new(StdMutex::new(HashSet::new()));
     let persistent = PersistentWorld {
       id: "survival".into(),
-      root: PathBuf::from("worlds/survival"),
+      root: PathBuf::from("saves/shared/survival"),
       paths: vec![PathBuf::from("world")],
     };
 
@@ -3052,8 +3069,9 @@ mod tests {
       .unwrap();
     let storage = directory
       .path()
-      .join("worlds/puzzle")
-      .join(owner.to_string());
+      .join("saves/players")
+      .join(owner.to_string())
+      .join("puzzle");
     assert!(storage.is_dir());
 
     assert!(
@@ -3607,7 +3625,7 @@ mod tests {
         .unwrap();
       manager.stop("game").await.unwrap();
       assert_eq!(
-        fs::read(directory.path().join("worlds/puzzle/world/level.dat"))
+        fs::read(directory.path().join("saves/shared/puzzle/world/level.dat"))
           .await
           .unwrap(),
         b"saved-progress"
@@ -3807,8 +3825,9 @@ mod tests {
     manager.stop(&started.server_id).await.unwrap();
     let persistent = directory
       .path()
-      .join("worlds/puzzle")
+      .join("saves/players")
       .join(player.to_string())
+      .join("puzzle")
       .join("world");
     assert_eq!(
       fs::read(persistent.join("level.dat")).await.unwrap(),
@@ -3870,8 +3889,9 @@ mod tests {
     assert_eq!(manager.cleanup_expired_solo_worlds(1).await, 0);
     let root = directory
       .path()
-      .join("worlds/puzzle")
-      .join(player.to_string());
+      .join("saves/players")
+      .join(player.to_string())
+      .join("puzzle");
     assert!(root.exists());
 
     manager.stop(&started.server_id).await.unwrap();
@@ -4378,10 +4398,10 @@ mod tests {
     fs::create_dir_all(root.join("java21/bin")).await.unwrap();
     fs::create_dir_all(root.join("java25/bin")).await.unwrap();
     fs::create_dir_all(root.join("servers")).await.unwrap();
-    fs::create_dir_all(root.join("worlds/survival/world"))
+    fs::create_dir_all(root.join("saves/shared/survival/world"))
       .await
       .unwrap();
-    fs::write(root.join("worlds/survival/world/level.dat"), b"old")
+    fs::write(root.join("saves/shared/survival/world/level.dat"), b"old")
       .await
       .unwrap();
     fs::write(root.join("cores/paper/1.21.11/server.jar"), b"server")
@@ -4568,13 +4588,13 @@ mod tests {
     assert!(!instance.work_dir.exists());
     assert!(instance.log_file.exists());
     assert_eq!(
-      fs::read(root.join("worlds/survival/world/level.dat"))
+      fs::read(root.join("saves/shared/survival/world/level.dat"))
         .await
         .unwrap(),
       b"updated"
     );
     assert_eq!(
-      fs::read(root.join("worlds/survival/world/loaded.dat"))
+      fs::read(root.join("saves/shared/survival/world/loaded.dat"))
         .await
         .unwrap(),
       b"old"

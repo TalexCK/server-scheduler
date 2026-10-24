@@ -2,11 +2,13 @@ mod api;
 mod catalog_check;
 mod client;
 mod config;
+mod daily_log;
 mod dependency_cache;
 mod layout;
 mod manager;
 mod network;
 mod protocol;
+mod resources;
 mod runtime;
 mod solo;
 mod world_store;
@@ -61,6 +63,8 @@ enum SchedulerCommand {
     lines: usize,
   },
   List,
+  /// Prepare and atomically activate the resource manifests.
+  Update,
   /// Compare local external definitions with the running daemon's game catalog (read-only).
   Catalog {
     game_id: Option<String>,
@@ -113,6 +117,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
       }
     }
+    SchedulerCommand::Update => {
+      let updater = resources::Updater::new(config.clone());
+      let revision = updater
+        .run()
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))?;
+      println!("Resource generation {revision} activated");
+    }
     SchedulerCommand::Catalog { game_id } => {
       catalog_check::run(&config, game_id.as_deref()).await?;
     }
@@ -131,9 +143,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_daemon(config: Arc<LoadedConfig>) -> Result<(), Box<dyn std::error::Error>> {
   let _pid_guard = ensure_daemon_pid_claim(&config).await?;
+  let daily_log = daily_log::DailyLog::new(&config.resolve(&config.value.paths.scheduler_log))?;
   tracing_subscriber::fmt()
+    .with_ansi(false)
+    .with_writer(daily_log.clone())
     .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
     .init();
+  tokio::spawn(async move {
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    loop {
+      interval.tick().await;
+      let log = daily_log.clone();
+      if let Ok(Err(error)) = tokio::task::spawn_blocking(move || log.maintain()).await {
+        eprintln!("Scheduler log maintenance failed: {error}");
+      }
+    }
+  });
   create_runtime_directories(&config).await?;
   let runtime_root = config.resolve(&config.value.paths.runtime);
   clear_runtime_directory(&runtime_root).await?;
@@ -179,7 +204,9 @@ async fn start_background(config: &LoadedConfig) -> Result<(), Box<dyn std::erro
   }
   fs::create_dir_all(config.resolve(&config.value.paths.logs))?;
   fs::create_dir_all(config.resolve(&config.value.paths.runtime))?;
-  let log_path = config.resolve(&config.value.paths.scheduler_log);
+  let log_path = config
+    .resolve(&config.value.paths.logs)
+    .join("scheduler-bootstrap.log");
   let stdout = OpenOptions::new()
     .create(true)
     .append(true)

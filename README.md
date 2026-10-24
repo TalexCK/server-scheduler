@@ -11,6 +11,10 @@ Scheduler 自身以后台进程运行，不提供持续交互式控制台。服�
 Velocity 自身退出、HTTP 连接断开或客户端超时，重启仍继续执行。相同服务器的并发
 启动/重启会被拒绝，避免重复进程；Scheduler 整体关闭时不会再为未完成的重启拉起替代进程。
 
+停止接口等到进程退出、存档保存和运行目录清理完成后才返回。CLI 停止请求和 Bridge
+停止/重启请求等待最多 180 秒，避免使用普通查询的短超时而误报正常关服失败。
+保存或清理真正失败时仍返回错误，并保留相应恢复资料。
+
 ## 实现结构
 
 部署根目录为 `shtechcraft-minigames/`，调度器源码位于相邻的 `server-scheduler/`，
@@ -128,16 +132,16 @@ Velocity 使用 `ports.velocity` 的固定入口端口。普通子服务器从 `
 Scheduler 使用以下目录布局：
 
 ```text
-cores/<core-kind>/<minecraft-version>/
-plugins/<plugin-id>/<minecraft-compatibility>/
-mods/<mod-id>/<minecraft-compatibility>/
+.resources/generations/<revision>/cores/<core-kind>/<minecraft-version>/
+.resources/generations/<revision>/plugins/<plugin-id>/<minecraft-compatibility>/
+.resources/generations/<revision>/mods/<mod-id>/<minecraft-compatibility>/
 dependencies/objects/<sha256-prefix>/<sha256>
 dependencies/manifests/servers/<server-id>.json
 files/<file-layer>/
 network/frpc
 network/frpc.toml
 servers/<server-id>.json
-worlds/<world-id>/
+saves/shared/<world-id>/
 ```
 
 `network/frpc` 是目标宿主机平台的可执行文件，`network/frpc.toml` 是其运行配置。
@@ -263,8 +267,8 @@ API 使用的服务器 ID。
 `world.mode` 支持：
 
 - `generated`：不复制世界模板，由服务端生成新世界。
-- `template`：将 `worlds/<world-id>/` 的内容复制到临时实例。
-- `persistent`：启动时从 `worlds/<world-id>/` 装载世界包，进程退出后将运行期
+- `template`：从 `worlds.json` 引用的 depend 地图压缩包解压到临时实例。
+- `persistent`：启动时从 `saves/shared/<world-id>/` 装载世界包，进程退出后将运行期
   存档安全写回。默认保存 `world`、`world_nether` 和 `world_the_end`。
 
 普通长期存档服可以这样配置：
@@ -293,7 +297,7 @@ API 使用的服务器 ID。
 
 `paths` 至少包含一项并且必须包含 `properties.level-name` 指定的主世界目录（默认
 `world`）；所有值只允许安全的相对路径，并且不能重复、大小写冲突或互相嵌套。
-首次启动前必须创建 `worlds/<world-id>/`，并把已有世界目录放在其中。
+首次启动前必须创建 `saves/shared/<world-id>/`，并把已有世界目录放在其中。
 同一个持久世界 ID 同时只能由一个实例占用，即使两个不同服务器定义引用了相同 ID，
 后启动的实例也会被拒绝。
 
@@ -334,7 +338,7 @@ ${RESOURCE_PACK_SHA1}
 回写世界。Scheduler 启动时会清空 `.runtime/` 中的普通历史残留，完整控制台输出只
 保留在独立的 `logs/` 目录中。
 
-`persistent` 以整个 `worlds/<world-id>/` 作为一次提交：先把旧世界包复制到 staging，
+`persistent` 以整个 `saves/shared/<world-id>/` 作为一次提交：先把旧世界包复制到 staging，
 再用 runtime 中实际存在的配置目录替换对应旧目录，最后通过 backup 和 rename 更新正式
 世界包。未在 runtime 中生成的可选世界会保留上一次副本，`session.lock` 不会进入存档，
 任何符号链接或特殊文件都会使保存失败。这样不会出现主世界已经更新、下界却仍是旧版本
@@ -427,7 +431,7 @@ Velocity 在线状态把玩家 UUID 解析为合法用户名，并先向目标�
 }
 ```
 
-地图放在 `worlds/shared_adventure/world/`（其他维度按实际服务端目录布局配置）。
+地图放在 `saves/shared/shared_adventure/world/`（其他维度按实际服务端目录布局配置）。
 启动会把持久存档复制到 runtime，停服完成后保存回同一目录，下次启动继续使用保存进度。
 共享存档沿用 persistent 的原子保存、并发写入保护和失败恢复机制，不按玩家创建副本，
 也不受 `solo_retention_days` 的私人存档到期清理影响。
@@ -436,9 +440,9 @@ Velocity 在线状态把玩家 UUID 解析为合法用户名，并先向目标�
 创建传送任务；正在启动时加入待传送队列；两个入口并发启动只创建一个实例。
 投票请求人数不受 `solo_max_players` 限制，该限制仅用于单人入口的单次请求。
 
-`player_world` 为每份名单创建独立动态实例、端口和 Velocity 服务器 ID。地图母版必须放在
-`worlds/<game-id>/world`，持久副本位于
-`worlds/<game-id>/<owner-uuid>/world`，旁边的 `config.json` 保存游戏、所有者、冻结
+`player_world` 为每份名单创建独立动态实例、端口和 Velocity 服务器 ID。地图母版通过
+`worlds.json` 引用 `depend/worlds/<地图ID>.tar.gz`，持久副本位于
+`saves/players/<owner-uuid>/<game-id>/world`，旁边的 `config.json` 保存游戏、所有者、冻结
 名单和创建、更新、过期时间。同一游戏中每名玩家最多占用一个世界；双人名单共享一份，
 名单内任一在线成员都能复用原所有者目录，不要求另一名成员同时在线；只有本次请求中在线
 且属于冻结名单的玩家会被传送，名单外玩家始终被拒绝。实例退出时先以 staging 和原子
@@ -603,3 +607,41 @@ Velocity 应先匹配当前实例 UUID；`open` 允许任意玩家进入，`rost
 [远程外服接入指南](docs/EXTERNAL_SERVERS.md)。
 
 面向玩家的分步操作见 [玩家迁移指南](docs/PLAYER_MIGRATION_GUIDE.md)，涵盖不同实例目录、已有大厅数据的保留、Xaero 路标转移、Voxy 缓存及备份恢复。
+
+## 清单资源与存档布局
+
+部署根目录的 `cores.json`、`mods.json`、`plugins.json`、`worlds.json` 使用 schema_version 1。
+每份清单有 artifacts 对象，资源包按 ID/兼容版本命名，files 中每项提供 target 与 source。
+一个核心包可以包含多个文件。source 支持 paper、fabric、modrinth_latest、spigot_latest、
+curseforge_latest，以及固定 url / modrinth / spigot / curseforge 和本地 file。
+
+默认最新来源固定 Minecraft 版本和加载器，按上游发布时间选择最新文件；Velocity 插件按
+代理平台选择。官方来源保存解析后的版本和下载校验值。file 只引用 depend/ 下人工维护的
+可读路径，不要求或校验本地哈希；缺少 LFS 内容会明确报错。
+
+Fabric 在资源更新阶段选择固定 Minecraft 版本下最新 Loader，并使用官方安装器
+提前生成完整的服务端包，包括 Fabric 服务端启动入口、Minecraft `server.jar` 和
+`libraries/`。安装器只在更新阶段执行，不作为游戏实例的启动 JAR。
+安装完成的文件按 Minecraft、Loader 和安装器版本缓存；重复更新验证并复用缓存。
+实例启动时链接已准备好的服务端文件。任一安装或下载失败都不会激活不完整的代次。
+
+`server-scheduler --config config.json update` 可离线于守护进程执行更新。
+游戏内 `/network update` 提交后台任务，由宿主机 Scheduler 在部署根目录执行
+`./server.sh update`；`/network update status` 查看结果。任务重复提交时复用正在运行的
+任务，标准输出和错误输出保存在部署日志目录的 `resource-update.log`。
+脚本非零退出时返回失败状态。脚本中的 Scheduler CLI `update` 执行原生资源更新，
+不会再次调用 HTTP 接口，因此不会递归触发同一命令。
+Admin API 为 GET/POST /admin/v1/resources/update，Bridge 为
+GET/POST /bridge/v1/resources/update；GET /bridge/v1/revision 返回激活代次。
+resources.rs 校验完整资源、世界压缩包和服务器定义后原子发布 current.json。
+失败保留当前代次，启动中的实例固定代次，运行中的实例继续使用其链接文件。
+重复更新复用已验证的远程下载缓存，本地文件直接链接。更新不读写 saves/。
+
+模板来自 depend/worlds/*.tar.gz，每次新实例解压到 runtime；玩家首次创建解谜会话时
+直接解压到 saves/players/<owner-uuid>/<game-id>/。双人共享一份拥有者存档。
+共享持久世界位于 saves/shared/<world-id>/。这些存档、数据库、运行缓存都应忽略提交。
+本地文件更新采用新的版本文件名并修改 source.path，以保留旧实例使用的文件。
+
+日志按宿主机日期轮转，每分钟检查；64 MiB 提前轮转，gzip 压缩后清空当前文件，
+归档保留 14 天。启动过程的 stdout/stderr 另存 logs/scheduler-bootstrap.log。
+部署 flake 提供 minigames-start/stop/update/check 和 scheduler，.envrc 使用小型子 flake。

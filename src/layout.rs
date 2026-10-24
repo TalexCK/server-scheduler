@@ -138,9 +138,7 @@ async fn prepare_inner(
     .is_none()
     .then(|| PersistentWorld::from_definition(config, &definition))
     .flatten();
-  let core_root = config
-    .resolve(&config.value.paths.cores)
-    .join(&definition.core.kind);
+  let core_root = config.resource_root("cores").join(&definition.core.kind);
   let core = resolve_core_version(
     &core_root,
     None,
@@ -175,9 +173,9 @@ async fn prepare_inner(
   if persistence.is_none()
     && let WorldDefinition::Template { id } = &definition.world
   {
-    let source = config.resolve(&config.value.paths.worlds).join(id);
-    ensure_exists(&source).await?;
-    copy_contents(&source, &work_dir).await?;
+    crate::resources::materialize_world(config, id, &work_dir)
+      .await
+      .map_err(|error| LayoutError::InvalidResource(error.to_string()))?;
   }
 
   for layer in &definition.files {
@@ -269,7 +267,7 @@ async fn install_plugin(
   work_dir: &Path,
   target: &Path,
 ) -> Result<(), LayoutError> {
-  let root = config.resolve(&config.value.paths.plugins).join(&plugin.id);
+  let root = config.resource_root("plugins").join(&plugin.id);
   let artifact = resolve_artifact_version(
     &root,
     plugin.version.as_deref(),
@@ -297,7 +295,7 @@ async fn install_mod(
   work_dir: &Path,
   mods_dir: &Path,
 ) -> Result<(), LayoutError> {
-  let root = config.resolve(&config.value.paths.mods).join(&module.id);
+  let root = config.resource_root("mods").join(&module.id);
   let artifact = resolve_artifact_version(
     &root,
     module.version.as_deref(),
@@ -334,7 +332,7 @@ async fn install_file_layer(
   } else {
     work_dir.join(&layer.target)
   };
-  copy_contents(&source, &target).await
+  link_contents(&source, &target).await
 }
 
 async fn render_file(
@@ -401,7 +399,7 @@ fn render_value(
   Ok(rendered)
 }
 
-async fn resolve_core_version(
+pub(crate) async fn resolve_core_version(
   root: &Path,
   explicit: Option<&str>,
   minecraft_version: &str,
@@ -440,7 +438,7 @@ async fn resolve_core_version(
   })
 }
 
-async fn resolve_artifact_version(
+pub(crate) async fn resolve_artifact_version(
   root: &Path,
   explicit: Option<&str>,
   minecraft_version: &str,
@@ -648,7 +646,11 @@ async fn transfer_contents(
 }
 
 async fn transfer_file(source: &Path, target: &Path, prefer_link: bool) -> Result<(), LayoutError> {
-  if prefer_link {
+  if prefer_link
+    && source
+      .extension()
+      .is_some_and(|ext| ext == "jar" || ext == "zip")
+  {
     if fs::try_exists(target)
       .await
       .map_err(|error| LayoutError::Io {
@@ -779,6 +781,8 @@ async fn ensure_exists(path: &Path) -> Result<(), LayoutError> {
 
 #[derive(Debug, Error)]
 pub enum LayoutError {
+  #[error("resource preparation failed: {0}")]
+  InvalidResource(String),
   #[error(transparent)]
   Dependency(#[from] dependency_cache::DependencyError),
   #[error(transparent)]

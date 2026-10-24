@@ -56,6 +56,8 @@ pub fn router(state: ApiState) -> Router {
       "/solo/sessions/{session_id}/destroy",
       post(destroy_solo_session),
     )
+    .route("/resources/update", post(resource_update))
+    .route("/resources/update", get(resource_update_status))
     .route("/system/shutdown", post(shutdown))
     .route_layer(middleware::from_fn_with_state(
       AuthState {
@@ -71,6 +73,11 @@ pub fn router(state: ApiState) -> Router {
       "/players",
       get(bridge_list_players).post(bridge_update_players),
     )
+    .route(
+      "/resources/update",
+      post(resource_update_bridge).get(resource_update_status_bridge),
+    )
+    .route("/revision", get(catalog_revision))
     .route("/definitions", get(bridge_definitions))
     .route("/games", get(bridge_games))
     .route("/games/details", get(bridge_game_details))
@@ -118,6 +125,39 @@ pub fn router(state: ApiState) -> Router {
     .nest("/admin/v1", admin)
     .nest("/bridge/v1", bridge)
     .with_state(state)
+}
+
+async fn resource_update(State(state): State<ApiState>) -> Json<crate::resources::UpdateStatus> {
+  Json(state.manager.resources.start().await)
+}
+async fn resource_update_status(
+  State(state): State<ApiState>,
+) -> Json<Option<crate::resources::UpdateStatus>> {
+  Json(state.manager.resources.status().await)
+}
+fn format_update(status: &crate::resources::UpdateStatus) -> String {
+  format!(
+    "Update {}: {} ({}/{})\n{}",
+    status.id, status.phase, status.completed, status.total, status.message
+  )
+}
+async fn resource_update_bridge(State(state): State<ApiState>) -> String {
+  format_update(&state.manager.resources.start().await)
+}
+async fn resource_update_status_bridge(State(state): State<ApiState>) -> String {
+  state
+    .manager
+    .resources
+    .status()
+    .await
+    .as_ref()
+    .map(format_update)
+    .unwrap_or_else(|| "No resource update has been started.".into())
+}
+async fn catalog_revision(State(state): State<ApiState>) -> String {
+  crate::resources::active_root(&state.config)
+    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+    .unwrap_or_else(|| "legacy".into())
 }
 
 async fn require_token(
@@ -852,6 +892,7 @@ mod tests {
     .await
     .unwrap();
     let config = Arc::new(LoadedConfig {
+      generation: None,
       file: root.join("config.json"),
       root: root.to_path_buf(),
       value: serde_json::from_value(serde_json::json!({

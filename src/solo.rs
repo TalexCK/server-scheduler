@@ -8,7 +8,8 @@ use thiserror::Error;
 use tokio::fs;
 use uuid::Uuid;
 
-use crate::world_store::{copy_tree, remove_path, try_exists};
+use crate::world_store::copy_tree;
+use crate::world_store::{remove_path, try_exists};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SoloWorldMetadata {
@@ -18,6 +19,8 @@ pub struct SoloWorldMetadata {
   pub created: u64,
   pub updated: u64,
   pub expires: u64,
+  #[serde(default)]
+  pub template_revision: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,17 +41,19 @@ pub fn expires_at(timestamp: u64, retention_days: u32) -> u64 {
   timestamp.saturating_add(u64::from(retention_days).saturating_mul(86_400))
 }
 
+#[cfg(test)]
 pub async fn create_storage(
-  worlds_root: &Path,
+  saves_root: &Path,
+  template_root: &Path,
   game_id: &str,
   owner: Uuid,
   players: Vec<Uuid>,
   retention_days: u32,
   timestamp: u64,
 ) -> Result<(SoloPersistence, SoloWorldMetadata), SoloError> {
-  let game_root = worlds_root.join(game_id);
+  let game_root = saves_root.join("players").join(owner.to_string());
   create_dir_all(&game_root).await?;
-  let root = game_root.join(owner.to_string());
+  let root = game_root.join(game_id);
   match fs::create_dir(&root).await {
     Ok(()) => {}
     Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
@@ -60,7 +65,7 @@ pub async fn create_storage(
   }
   let result = async {
     let world = root.join("world");
-    let template = game_root.join("world");
+    let template = template_root.join(game_id).join("world");
     if !try_exists(&template).await? {
       return Err(SoloError::MissingWorld(template));
     }
@@ -72,6 +77,7 @@ pub async fn create_storage(
       created: timestamp,
       updated: timestamp,
       expires: expires_at(timestamp, retention_days),
+      template_revision: None,
     };
     write_metadata(&root, &metadata).await?;
     Ok((
@@ -87,6 +93,98 @@ pub async fn create_storage(
     let _ = fs::remove_dir_all(&root).await;
   }
   result
+}
+
+pub async fn create_from_config(
+  config: &crate::config::LoadedConfig,
+  game_id: &str,
+  template_id: &str,
+  owner: Uuid,
+  players: Vec<Uuid>,
+  retention_days: u32,
+  timestamp: u64,
+) -> Result<(SoloPersistence, SoloWorldMetadata), SoloError> {
+  let parent = config
+    .resolve(&config.value.paths.saves)
+    .join("players")
+    .join(owner.to_string());
+  create_dir_all(&parent).await?;
+  let root = parent.join(game_id);
+  match fs::create_dir(&root).await {
+    Ok(()) => {}
+    Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+      return Err(SoloError::AlreadyExists(root));
+    }
+    Err(source) => return Err(SoloError::Io { path: root, source }),
+  }
+  let result = async {
+    crate::resources::materialize_world(config, template_id, &root)
+      .await
+      .map_err(|e| SoloError::Template(e.to_string()))?;
+    if !try_exists(&root.join("world")).await? {
+      return Err(SoloError::MissingWorld(root.join("world")));
+    }
+    let persistence = SoloPersistence {
+      root: root.clone(),
+      retention_days,
+    };
+    let metadata = SoloWorldMetadata {
+      game: game_id.to_owned(),
+      owner,
+      players,
+      created: timestamp,
+      updated: timestamp,
+      expires: expires_at(timestamp, retention_days),
+      template_revision: crate::resources::active_root(config)
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string())),
+    };
+    write_metadata(&persistence.root, &metadata).await?;
+    Ok((persistence, metadata))
+  }
+  .await;
+  if result.is_err() {
+    let _ = fs::remove_dir_all(&root).await;
+  }
+  result
+}
+
+pub async fn player_session_roots(saves: &Path, game_id: &str) -> Result<Vec<PathBuf>, SoloError> {
+  let players = saves.join("players");
+  if !try_exists(&players).await? {
+    return Ok(Vec::new());
+  }
+  let mut entries = fs::read_dir(&players)
+    .await
+    .map_err(|source| SoloError::Io {
+      path: players.clone(),
+      source,
+    })?;
+  let mut roots = Vec::new();
+  while let Some(entry) = entries.next_entry().await.map_err(|source| SoloError::Io {
+    path: players.clone(),
+    source,
+  })? {
+    if entry
+      .file_type()
+      .await
+      .map_err(|source| SoloError::Io {
+        path: entry.path(),
+        source,
+      })?
+      .is_dir()
+      && entry
+        .file_name()
+        .to_str()
+        .is_some_and(|s| s.parse::<Uuid>().is_ok())
+    {
+      let root = entry.path().join(game_id);
+      if root.join("config.json").is_file() {
+        roots.push(root);
+      }
+    }
+  }
+  roots.sort();
+  Ok(roots)
 }
 
 pub async fn read_metadata(root: &Path) -> Result<SoloWorldMetadata, SoloError> {
@@ -188,39 +286,6 @@ pub async fn persist_world(
   Ok(())
 }
 
-pub async fn game_session_roots(game_root: &Path) -> Result<Vec<PathBuf>, SoloError> {
-  if !try_exists(game_root).await? {
-    return Ok(Vec::new());
-  }
-  let mut entries = fs::read_dir(game_root)
-    .await
-    .map_err(|source| SoloError::Io {
-      path: game_root.to_path_buf(),
-      source,
-    })?;
-  let mut roots = Vec::new();
-  while let Some(entry) = entries.next_entry().await.map_err(|source| SoloError::Io {
-    path: game_root.to_path_buf(),
-    source,
-  })? {
-    let path = entry.path();
-    if entry
-      .file_type()
-      .await
-      .map_err(|source| SoloError::Io {
-        path: path.clone(),
-        source,
-      })?
-      .is_dir()
-      && path.join("config.json").is_file()
-    {
-      roots.push(path);
-    }
-  }
-  roots.sort();
-  Ok(roots)
-}
-
 pub async fn destroy_storage(persistence: &SoloPersistence) -> Result<(), SoloError> {
   match fs::remove_dir_all(&persistence.root).await {
     Ok(()) => Ok(()),
@@ -243,6 +308,8 @@ async fn create_dir_all(path: &Path) -> Result<(), SoloError> {
 
 #[derive(Debug, Error)]
 pub enum SoloError {
+  #[error("world template failed: {0}")]
+  Template(String),
   #[error(transparent)]
   WorldStore(#[from] crate::world_store::WorldStoreError),
   #[error("failed to access {path}: {source}")]
@@ -276,7 +343,7 @@ mod tests {
       .unwrap();
     let owner = Uuid::new_v4();
     let (persistence, mut metadata) =
-      create_storage(&worlds, "puzzle", owner, vec![owner], 10, 100)
+      create_storage(&worlds, &worlds, "puzzle", owner, vec![owner], 10, 100)
         .await
         .unwrap();
     assert!(persistence.root.join("world/region/r.0.0.mca").exists());
