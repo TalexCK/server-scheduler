@@ -137,6 +137,17 @@ impl LoadedConfig {
     config
   }
 
+  pub fn pinned_for(&self, id: &str) -> Self {
+    let path = crate::deployment::server_root(self, id);
+    if path.is_dir() {
+      let mut config = self.clone();
+      config.generation = Some(path);
+      config
+    } else {
+      self.pinned()
+    }
+  }
+
   pub fn resource_root(&self, kind: &str) -> PathBuf {
     if let Some(root) = crate::resources::active_root(self) {
       return root.join(kind);
@@ -153,6 +164,13 @@ impl LoadedConfig {
   }
 
   pub fn resolve(&self, path: &Path) -> PathBuf {
+    if path == self.value.paths.files {
+      if let Some(root) = &self.generation {
+        if root.join("files").is_dir() {
+          return root.join("files");
+        }
+      }
+    }
     if path.is_absolute() {
       path.to_path_buf()
     } else {

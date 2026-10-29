@@ -101,6 +101,9 @@ pub fn active_root(config: &LoadedConfig) -> Option<PathBuf> {
     return Some(root.clone());
   }
   let root = config.resolve(&config.value.paths.resources);
+  if root.join("catalog").is_dir() && root.join("current.json").is_file() {
+    return Some(root.join("catalog"));
+  }
   match std::fs::read(root.join("current.json")) {
     Ok(bytes) => {
       let revision = serde_json::from_slice::<ActiveGeneration>(&bytes)
@@ -142,9 +145,110 @@ impl Updater {
     }
   }
   pub async fn status(&self) -> Option<UpdateStatus> {
+    let path = self
+      .config
+      .resolve(&self.config.value.paths.manifests)
+      .join("state/update.json");
+    if let Ok(bytes) = tokio::fs::read(&path).await {
+      if let Ok(mut status) = serde_json::from_slice::<UpdateStatus>(&bytes) {
+        if status.phase == "queued" {
+          let age = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok());
+          if age.is_some_and(|a| a.as_secs() > 30) {
+            status.phase = "failed".into();
+            status.message =
+              "Update launcher did not start its worker; inspect logs/update-launch.log".into();
+          }
+        }
+        #[cfg(unix)]
+        if matches!(status.phase.as_str(), "running" | "waiting") {
+          let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+          if let Some(pid) = value["pid"].as_i64() {
+            if unsafe { libc::kill(pid as i32, 0) } != 0
+              && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+              status.phase = "failed".into();
+              status.message = "Update worker exited unexpectedly; inspect logs/update.log".into();
+            }
+          }
+        }
+        return Some(status);
+      }
+    }
     self.status.lock().await.clone()
   }
   pub async fn start(&self) -> UpdateStatus {
+    if let Some(current) = self
+      .status()
+      .await
+      .filter(|s| matches!(s.phase.as_str(), "queued" | "running" | "waiting"))
+    {
+      return current;
+    }
+    let mut state = self.status.lock().await;
+    if let Some(current) = state.as_ref().filter(|s| s.phase == "running") {
+      return current.clone();
+    }
+    let root = self.config.resolve(&self.config.value.paths.manifests);
+    let mut next = UpdateStatus {
+      id: Uuid::new_v4().to_string(),
+      phase: "queued".into(),
+      completed: 0,
+      total: 1,
+      message: "Starting independent deployment worker; log: logs/update.log".into(),
+      revision: None,
+    };
+    let task_state = self.status.clone();
+    let task_id = next.id.clone();
+    let result = (|| -> io::Result<()> {
+      let log_path = self
+        .config
+        .resolve(&self.config.value.paths.logs)
+        .join("update-launch.log");
+      std::fs::create_dir_all(log_path.parent().unwrap())?;
+      let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+      let mut command = std::process::Command::new(root.join("server.sh"));
+      command
+        .arg("update")
+        .arg("--background")
+        .current_dir(&root)
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+      #[cfg(unix)]
+      {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+      }
+      let mut child = command.spawn()?;
+      // Reap the short-lived launcher; the worker has its own session and lock.
+      std::thread::spawn(move || {
+        let result = child.wait();
+        if !result.as_ref().is_ok_and(|status| status.success()) {
+          let mut state = task_state.blocking_lock();
+          if let Some(status) = state.as_mut().filter(|s| s.id == task_id) {
+            status.phase = "failed".into();
+            status.message =
+              format!("Update launcher failed: {result:?}; inspect logs/update-launch.log");
+          }
+        }
+      });
+      Ok(())
+    })();
+    if let Err(error) = result {
+      next.phase = "failed".into();
+      next.message = format!("Unable to launch deployment update: {error}");
+    }
+    *state = Some(next.clone());
+    next
+  }
+  #[cfg(test)]
+  pub async fn start_legacy(&self) -> UpdateStatus {
     let mut status = self.status.lock().await;
     if let Some(current) = status.as_ref().filter(|s| s.phase == "running") {
       return current.clone();
@@ -189,6 +293,7 @@ impl Updater {
     next
   }
 
+  #[cfg(test)]
   async fn run_server_update(&self) -> Result<String> {
     // Runtime configuration can live under database/. The manifests path names
     // the deployment root containing server.sh, independently of the daemon cwd.
@@ -244,11 +349,14 @@ impl Updater {
     Ok(active.revision)
   }
   async fn progress(&self, message: String) {
+    eprintln!("{message}");
+    report_worker_message(&message);
     if let Some(s) = self.status.lock().await.as_mut() {
       s.completed += 1;
       s.message = message;
     }
   }
+  #[cfg(test)]
   pub async fn run(&self) -> Result<String> {
     let config = &self.config;
     let resource_root = config.resolve(&config.value.paths.resources);
@@ -259,7 +367,7 @@ impl Updater {
       .join("generations")
       .join(format!(".staging-{revision}"));
     tokio::fs::create_dir(&staging).await?;
-    let result = self.prepare(&staging).await;
+    let result = self.prepare(&staging, None).await;
     if let Err(error) = result {
       let _ = tokio::fs::remove_dir_all(&staging).await;
       return Err(error);
@@ -275,7 +383,7 @@ impl Updater {
     )?;
     Ok(revision)
   }
-  async fn prepare(&self, staging: &Path) -> Result<()> {
+  pub(crate) async fn prepare(&self, staging: &Path, server: Option<&str>) -> Result<()> {
     let config = &self.config;
     let mut manifests = BTreeMap::new();
     for kind in KINDS {
@@ -289,6 +397,9 @@ impl Updater {
       validate_manifest(kind, &manifest)?;
       tokio::fs::write(staging.join(format!("{kind}.json")), bytes).await?;
       manifests.insert(kind, manifest);
+    }
+    if let Some(id) = server {
+      crate::deployment::select_manifests(config, staging, id, &mut manifests).await?;
     }
     let total = manifests
       .values()
@@ -307,6 +418,9 @@ impl Updater {
       for (id, bundle) in &mut manifest.artifacts {
         let mut prepared = Vec::new();
         for declared in &bundle.files {
+          let message = format!("Preparing {kind}/{id}/{}", declared.target.display());
+          eprintln!("{message}");
+          report_worker_message(&message);
           let files = if let Source::FabricLatest { game_version } = &declared.source {
             if *kind != "cores" || declared.target.components().count() != 1 {
               return Err(
@@ -320,21 +434,37 @@ impl Updater {
               .fabric_files(&client, game_version, &declared.target)
               .await?
           } else {
-            vec![resolve_file(&client, declared).await?]
+            vec![resolve_file(&client, declared).await.map_err(|e| {
+              io::Error::other(format!("{kind}/{id}/{}: {e}", declared.target.display()))
+            })?]
           };
           if let Some(status) = self.status.lock().await.as_mut() {
             status.total += files.len().saturating_sub(1);
           }
           for mut file in files {
-            let object = self
-              .obtain(
-                &client,
-                &file,
-                &config
-                  .resolve(&config.value.paths.resources)
-                  .join("objects"),
-              )
-              .await?;
+            let objects = config
+              .resolve(&config.value.paths.resources)
+              .join("objects");
+            let mut attempt = 0;
+            let object = loop {
+              attempt += 1;
+              match self.obtain(&client, &file, &objects).await {
+                Ok(path) => break path,
+                Err(error) => {
+                  eprintln!(
+                    "{kind}/{id}/{} attempt {attempt}/3: {error}",
+                    file.target.display()
+                  );
+                  if attempt >= 3 || matches!(file.source, Source::File { .. }) {
+                    return Err(
+                      io::Error::other(format!("{kind}/{id}/{}: {error}", file.target.display()))
+                        .into(),
+                    );
+                  }
+                  tokio::time::sleep(Duration::from_secs(attempt)).await;
+                }
+              }
+            };
             if matches!(file.source, Source::File { .. }) {
               file.sha256.clear();
               file.sha512 = None;
@@ -376,7 +506,12 @@ impl Updater {
     tokio::fs::create_dir(staging.join("servers")).await?;
     let mut entries = tokio::fs::read_dir(&servers).await?;
     while let Some(entry) = entries.next_entry().await? {
-      if entry.file_type().await?.is_file() && entry.path().extension().is_some_and(|s| s == "json")
+      if entry.file_type().await?.is_file()
+        && entry.path().extension().is_some_and(|s| s == "json")
+        && server.is_none_or(|id| {
+          entry.file_name() == format!("{id}.json").as_str()
+            || entry.file_name() == "external-servers.json"
+        })
       {
         tokio::fs::copy(
           entry.path(),
@@ -479,9 +614,8 @@ impl Updater {
     let stage = objects.join(format!(".fabric-{}", Uuid::new_v4()));
     tokio::fs::create_dir_all(&stage).await?;
     let result = async {
-      let output = tokio::time::timeout(
-        Duration::from_secs(600),
-        tokio::process::Command::new(self.config.java_bin(crate::config::JavaVersion::Java25))
+      let output = logged_command(
+        java_command(&self.config, crate::config::JavaVersion::Java25)
           .arg("-Xmx512M")
           .arg("-jar")
           .arg(installer)
@@ -493,12 +627,10 @@ impl Updater {
           .arg("-dir")
           .arg(&stage)
           .arg("-downloadMinecraft")
-          .stdin(std::process::Stdio::null())
-          .kill_on_drop(true)
-          .output(),
+          .stdin(std::process::Stdio::null()),
+        Duration::from_secs(600),
       )
-      .await
-      .map_err(|_| io::Error::other("Fabric server preparation timed out"))??;
+      .await?;
       if !output.status.success() {
         return Err(
           io::Error::other(format!(
@@ -593,6 +725,7 @@ impl Updater {
     if file.sha256.len() == 64 {
       let object = objects.join(&file.sha256[..2]).join(&file.sha256);
       if verified(&object, file).await? {
+        eprintln!("Cache hit: {}", file.target.display());
         return Ok(object);
       }
     }
@@ -617,6 +750,7 @@ impl Updater {
             expected.size = cached.size;
           }
           if verified(&object, &expected).await? {
+            eprintln!("Cache hit: {}", file.target.display());
             return Ok(object);
           }
         }
@@ -630,12 +764,24 @@ impl Updater {
         source => {
           let url = resolve_url(client, source).await?;
           validate_url(&url)?;
-          let mut response = client.get(url).send().await?.error_for_status()?;
+          let message = format!("Downloading {} from {url}", file.target.display());
+          eprintln!("{message}");
+          report_worker_message(&message);
+          let mut response = client.get(&url).send().await?.error_for_status()?;
           let mut output = tokio::fs::File::create(&temporary).await?;
           use tokio::io::AsyncWriteExt;
           let mut size = 0u64;
+          let mut reported = std::time::Instant::now();
           while let Some(chunk) = response.chunk().await? {
             size += chunk.len() as u64;
+            if reported.elapsed() >= Duration::from_secs(5) {
+              eprintln!("Downloading {}: {size} bytes", file.target.display());
+              report_worker_message(&format!(
+                "Downloading {}: {size} bytes",
+                file.target.display()
+              ));
+              reported = std::time::Instant::now();
+            }
             if size
               > if file.size > 0 {
                 file.size
@@ -677,6 +823,90 @@ impl Updater {
     result
   }
 }
+fn report_worker_message(message: &str) {
+  let (Ok(root), Ok(task)) = (
+    std::env::var("SHTECHCRAFT_ROOT"),
+    std::env::var("SHTECHCRAFT_UPDATE_ID"),
+  ) else {
+    return;
+  };
+  let path = PathBuf::from(root).join("state/update.json");
+  let Ok(bytes) = std::fs::read(&path) else {
+    return;
+  };
+  let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+    return;
+  };
+  if value["id"].as_str() != Some(task.as_str()) {
+    return;
+  }
+  value["message"] = message.into();
+  let _ = atomic_json(&path, &value);
+}
+
+pub(crate) fn java_command(
+  config: &LoadedConfig,
+  version: crate::config::JavaVersion,
+) -> tokio::process::Command {
+  let mut command = tokio::process::Command::new(config.java_bin(version));
+  if let Ok(proxy) = std::env::var("HTTPS_PROXY").or_else(|_| std::env::var("https_proxy")) {
+    if let Ok(url) = reqwest::Url::parse(&proxy) {
+      if matches!(url.scheme(), "http" | "https") {
+        if let Some(host) = url.host_str() {
+          let port = url.port_or_known_default().unwrap_or(80);
+          command
+            .arg(format!("-Dhttps.proxyHost={host}"))
+            .arg(format!("-Dhttps.proxyPort={port}"))
+            .arg(format!("-Dhttp.proxyHost={host}"))
+            .arg(format!("-Dhttp.proxyPort={port}"));
+        }
+      }
+    }
+  }
+  command
+}
+
+pub(crate) async fn logged_command(
+  command: &mut tokio::process::Command,
+  timeout: Duration,
+) -> Result<std::process::Output> {
+  use tokio::io::AsyncReadExt;
+  async fn stream(mut reader: impl tokio::io::AsyncRead + Unpin) -> io::Result<Vec<u8>> {
+    let mut tail = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+      let n = reader.read(&mut chunk).await?;
+      if n == 0 {
+        break;
+      }
+      eprint!("{}", String::from_utf8_lossy(&chunk[..n]));
+      tail.extend_from_slice(&chunk[..n]);
+      if tail.len() > 8192 {
+        tail.drain(..tail.len() - 8192);
+      }
+    }
+    Ok(tail)
+  }
+  let mut child = command
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .kill_on_drop(true)
+    .spawn()?;
+  let stdout = child.stdout.take().unwrap();
+  let stderr = child.stderr.take().unwrap();
+  let result = tokio::time::timeout(timeout, async {
+    let (status, stdout, stderr) = tokio::join!(child.wait(), stream(stdout), stream(stderr));
+    Ok::<_, io::Error>(std::process::Output {
+      status: status?,
+      stdout: stdout?,
+      stderr: stderr?,
+    })
+  })
+  .await
+  .map_err(|_| io::Error::other("core preparation timed out"))??;
+  Ok(result)
+}
+
 fn validate_url(url: &str) -> Result<()> {
   let url = reqwest::Url::parse(url)?;
   if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
@@ -964,7 +1194,7 @@ pub async fn materialize_world(config: &LoadedConfig, id: &str, target: &Path) -
   let target = target.to_path_buf();
   tokio::task::spawn_blocking(move || extract_archive(&archive, &target)).await?
 }
-fn validate_archive(path: &Path) -> Result<()> {
+pub(crate) fn validate_archive(path: &Path) -> Result<()> {
   visit_archive(path, None)
 }
 fn extract_archive(path: &Path, target: &Path) -> Result<()> {
@@ -1022,9 +1252,9 @@ fn digest_file(path: &Path) -> Result<(String, u64)> {
   }
   Ok((format!("{:x}", hash.finalize()), size))
 }
-struct UpdateLock(std::fs::File);
+pub(crate) struct UpdateLock(std::fs::File);
 impl UpdateLock {
-  fn acquire(path: &Path) -> Result<Self> {
+  pub(crate) fn acquire(path: &Path) -> Result<Self> {
     let file = std::fs::OpenOptions::new()
       .create(true)
       .truncate(false)
@@ -1052,15 +1282,58 @@ impl Drop for UpdateLock {
   }
 }
 async fn json_get(client: &reqwest::Client, url: &str) -> Result<serde_json::Value> {
-  Ok(
-    client
-      .get(url)
-      .send()
-      .await?
-      .error_for_status()?
-      .json()
-      .await?,
-  )
+  request_json(client.get(url)).await
+}
+async fn request_json(request: reqwest::RequestBuilder) -> Result<serde_json::Value> {
+  let url = request.try_clone().unwrap().build()?.url().to_string();
+  let memo = std::env::var("SHTECHCRAFT_ROOT")
+    .ok()
+    .zip(std::env::var("SHTECHCRAFT_UPDATE_ID").ok())
+    .map(|(root, task)| {
+      PathBuf::from(root).join("cache/metadata").join(format!(
+        "{:x}.json",
+        Sha256::digest(format!("{task}/{url}"))
+      ))
+    });
+  if let Some(path) = &memo {
+    if let Ok(bytes) = tokio::fs::read(path).await {
+      if let Ok(value) = serde_json::from_slice(&bytes) {
+        return Ok(value);
+      }
+    }
+  }
+  let mut last = String::new();
+  for attempt in 1..=3 {
+    match async {
+      request
+        .try_clone()
+        .unwrap()
+        .timeout(Duration::from_secs(45))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<serde_json::Value>()
+        .await
+    }
+    .await
+    {
+      Ok(value) => {
+        if let Some(path) = &memo {
+          std::fs::create_dir_all(path.parent().unwrap())?;
+          atomic_json(path, &value)?;
+        }
+        return Ok(value);
+      }
+      Err(error) => {
+        last = format!("GET {url}: {error}");
+        eprintln!("Attempt {attempt}/3 failed: {last}");
+        if attempt < 3 {
+          tokio::time::sleep(Duration::from_secs(attempt)).await;
+        }
+      }
+    }
+  }
+  Err(io::Error::other(last).into())
 }
 async fn resolve_file(client: &reqwest::Client, file: &ResourceFile) -> Result<ResourceFile> {
   let mut resolved = file.clone();
@@ -1168,16 +1441,16 @@ async fn resolve_file(client: &reqwest::Client, file: &ResourceFile) -> Result<R
       if loader != "velocity" {
         query.push(("game_versions", serde_json::to_string(&[game_version])?));
       }
-      let versions: Vec<serde_json::Value> = client
-        .get(format!(
-          "https://api.modrinth.com/v2/project/{project}/version"
-        ))
-        .query(&query)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+      let versions: Vec<serde_json::Value> = serde_json::from_value(
+        request_json(
+          client
+            .get(format!(
+              "https://api.modrinth.com/v2/project/{project}/version"
+            ))
+            .query(&query),
+        )
+        .await?,
+      )?;
       let v = versions
         .iter()
         .max_by_key(|v| v["date_published"].as_str().unwrap_or_default())
@@ -1259,7 +1532,7 @@ async fn resolve_file(client: &reqwest::Client, file: &ResourceFile) -> Result<R
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
   use super::*;
 
   #[cfg(unix)]
@@ -1313,8 +1586,8 @@ printf '{"revision":"10000000-0000-0000-0000-000000000001"}\n' > .resources/curr
 "##,
     )
     .await;
-    let first = updater.start().await;
-    let concurrent = updater.start().await;
+    let first = updater.start_legacy().await;
+    let concurrent = updater.start_legacy().await;
     assert_eq!(first.id, concurrent.id);
     std::fs::write(root.join("allow-update"), b"").unwrap();
     let status = finished_update(&updater).await;
@@ -1345,7 +1618,7 @@ printf '{"revision":"10000000-0000-0000-0000-000000000001"}\n' > .resources/curr
     )
     .unwrap();
     let before = std::fs::read(&pointer).unwrap();
-    updater.start().await;
+    updater.start_legacy().await;
     let status = finished_update(&updater).await;
     assert_eq!(status.phase, "failed");
     assert!(status.message.contains("download failed"));
@@ -1358,7 +1631,7 @@ printf '{"revision":"10000000-0000-0000-0000-000000000001"}\n' > .resources/curr
   async fn network_update_requires_server_sh_and_does_not_fall_back_to_native_update() {
     let (_temp, updater, root) = command_fixture("#!/bin/sh\nexit 0\n").await;
     std::fs::remove_file(root.join("server.sh")).unwrap();
-    updater.start().await;
+    updater.start_legacy().await;
     let status = finished_update(&updater).await;
     assert_eq!(status.phase, "failed");
     assert!(status.message.contains("server.sh update"));
@@ -1459,7 +1732,7 @@ printf 'loader library' > "$output/libraries/net/fabricmc/fabric-loader/loader.j
         .is_err()
     );
   }
-  async fn fixture() -> (tempfile::TempDir, Arc<LoadedConfig>) {
+  pub(crate) async fn fixture() -> (tempfile::TempDir, Arc<LoadedConfig>) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     std::fs::create_dir_all(root.join("depend")).unwrap();

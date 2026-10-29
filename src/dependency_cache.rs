@@ -75,14 +75,7 @@ async fn materialize_at(
   for (relative, hash) in &manifest.files {
     validate_hash(hash)?;
     let relative_path = parse_relative_path(relative)?;
-    let object = object_path(cache_root, hash);
-    if !try_exists(&object).await? {
-      return Err(DependencyError::MissingObject(object));
-    }
     let target = work_dir.join(relative_path);
-    if let Some(parent) = target.parent() {
-      create_dir_all(parent).await?;
-    }
     if try_exists(&target).await? {
       let metadata = symlink_metadata(&target).await?;
       if metadata.file_type().is_symlink() {
@@ -91,7 +84,15 @@ async fn materialize_at(
       if !metadata.is_file() {
         return Err(DependencyError::InvalidPath(target));
       }
-      remove_file(&target).await?;
+      // Declared core/plugin resources win over an older runtime cache.
+      continue;
+    }
+    let object = object_path(cache_root, hash);
+    if !try_exists(&object).await? {
+      return Err(DependencyError::MissingObject(object));
+    }
+    if let Some(parent) = target.parent() {
+      create_dir_all(parent).await?;
     }
     link_or_copy(&object, &target).await?;
   }
@@ -460,6 +461,31 @@ pub enum DependencyError {
 mod tests {
   use super::*;
 
+  #[tokio::test]
+  async fn declared_dependencies_are_not_replaced_by_stale_runtime_cache() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("cache");
+    let original = directory.path().join("original");
+    fs::create_dir_all(original.join("libraries"))
+      .await
+      .unwrap();
+    fs::write(original.join("libraries/core.jar"), b"old")
+      .await
+      .unwrap();
+    capture_at(&cache, "game", &original, &BTreeMap::new())
+      .await
+      .unwrap();
+    let runtime = directory.path().join("runtime");
+    fs::create_dir_all(runtime.join("libraries")).await.unwrap();
+    fs::write(runtime.join("libraries/core.jar"), b"new declared core")
+      .await
+      .unwrap();
+    materialize_at(&cache, "game", &runtime).await.unwrap();
+    assert_eq!(
+      fs::read(runtime.join("libraries/core.jar")).await.unwrap(),
+      b"new declared core"
+    );
+  }
   #[tokio::test]
   async fn snapshot_only_contains_dependency_directories() {
     let directory = tempfile::tempdir().unwrap();

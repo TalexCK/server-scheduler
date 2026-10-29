@@ -1059,7 +1059,17 @@ impl InstanceManager {
     spec: LaunchSpec,
     players: Vec<String>,
   ) -> Result<InstanceInfo, ManagerError> {
-    let pinned = Arc::new(self.config.pinned());
+    let lock_config = self.config.clone();
+    let _publication = tokio::task::spawn_blocking(move || {
+      crate::deployment::PublicationLock::acquire(&lock_config, false)
+    })
+    .await
+    .map_err(|e| ManagerError::State(e.to_string()))?
+    .map_err(|source| ManagerError::Io {
+      path: crate::deployment::root(&self.config),
+      source,
+    })?;
+    let pinned = Arc::new(self.config.pinned_for(&spec.definition_id));
     let definition = pinned
       .load_server(&spec.definition_id)
       .await

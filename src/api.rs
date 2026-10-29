@@ -155,8 +155,15 @@ async fn resource_update_status_bridge(State(state): State<ApiState>) -> String 
     .unwrap_or_else(|| "No resource update has been started.".into())
 }
 async fn catalog_revision(State(state): State<ApiState>) -> String {
-  crate::resources::active_root(&state.config)
-    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+  let pointer = state
+    .config
+    .resolve(&state.config.value.paths.resources)
+    .join("current.json");
+  tokio::fs::read(pointer)
+    .await
+    .ok()
+    .and_then(|bytes| serde_json::from_slice::<crate::resources::ActiveGeneration>(&bytes).ok())
+    .map(|p| p.revision)
     .unwrap_or_else(|| "legacy".into())
 }
 
@@ -187,10 +194,28 @@ fn valid_bearer(headers: &HeaderMap, expected: &str) -> bool {
 #[derive(Serialize)]
 struct HealthResponse {
   status: &'static str,
+  binary_sha256: &'static str,
+  deployment_layout: &'static str,
 }
 
 async fn health() -> Json<HealthResponse> {
-  Json(HealthResponse { status: "ok" })
+  static BINARY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+  let hash = BINARY.get_or_init(|| {
+    use sha2::{Digest, Sha256};
+    let path = if cfg!(target_os = "linux") {
+      std::path::PathBuf::from("/proc/self/exe")
+    } else {
+      std::env::current_exe().unwrap_or_default()
+    };
+    std::fs::read(path)
+      .map(|b| format!("{:x}", Sha256::digest(b)))
+      .unwrap_or_default()
+  });
+  Json(HealthResponse {
+    status: "ok",
+    binary_sha256: hash,
+    deployment_layout: "per-server-cache-v1",
+  })
 }
 
 async fn list_servers(State(state): State<ApiState>) -> Json<Vec<crate::protocol::InstanceInfo>> {

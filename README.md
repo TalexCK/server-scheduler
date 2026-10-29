@@ -132,11 +132,11 @@ Velocity 使用 `ports.velocity` 的固定入口端口。普通子服务器从 `
 Scheduler 使用以下目录布局：
 
 ```text
-.resources/generations/<revision>/cores/<core-kind>/<minecraft-version>/
-.resources/generations/<revision>/plugins/<plugin-id>/<minecraft-compatibility>/
-.resources/generations/<revision>/mods/<mod-id>/<minecraft-compatibility>/
-dependencies/objects/<sha256-prefix>/<sha256>
-dependencies/manifests/servers/<server-id>.json
+cache/servers/<server-id>/cores/<core-kind>/<minecraft-version>/
+cache/servers/<server-id>/plugins/<plugin-id>/<minecraft-compatibility>/
+cache/servers/<server-id>/mods/<mod-id>/<minecraft-compatibility>/
+cache/dependencies/objects/<sha256-prefix>/<sha256>
+cache/dependencies/manifests/servers/<server-id>.json
 files/<file-layer>/
 network/frpc
 network/frpc.toml
@@ -623,24 +623,33 @@ Fabric 在资源更新阶段选择固定 Minecraft 版本下最新 Loader，并�
 提前生成完整的服务端包，包括 Fabric 服务端启动入口、Minecraft `server.jar` 和
 `libraries/`。安装器只在更新阶段执行，不作为游戏实例的启动 JAR。
 安装完成的文件按 Minecraft、Loader 和安装器版本缓存；重复更新验证并复用缓存。
-实例启动时链接已准备好的服务端文件。任一安装或下载失败都不会激活不完整的代次。
+实例启动时链接已准备好的服务端文件。任一安装或下载失败都不会发布该服务器的不完整资源。
 
-`server-scheduler --config config.json update` 可离线于守护进程执行更新。
-游戏内 `/network update` 提交后台任务，由宿主机 Scheduler 在部署根目录执行
-`./server.sh update`；`/network update status` 查看结果。任务重复提交时复用正在运行的
-任务，标准输出和错误输出保存在部署日志目录的 `resource-update.log`。
-脚本非零退出时返回失败状态。脚本中的 Scheduler CLI `update` 执行原生资源更新，
-不会再次调用 HTTP 接口，因此不会递归触发同一命令。
+部署入口是 `./server.sh update`。它启动独立的 Python 更新进程，完成 Git 快进拉取、
+LFS 下载、按服务器准备资源、等待无人/维护窗口应用、桥接 READY 验证和缓存清理。
+`/network update` 通过相同入口启动任务；后台任务在 Scheduler/Proxy 重启后继续运行。
+任务状态保存为 `state/update.json`，日志为 `logs/update.log`，入口失败日志为
+`logs/update-launch.log`。重复提交受文件锁保护，GET 状态在守护进程重启后仍可读取。
+
+资源 CLI `prepare <server-id> [--local-only]` 只准备该服务引用的资源；
+`cache-gc` 清理无引用的下载对象；`rollback-resources <server-id>` 恢复验证期间暂存的旧集。
+CLI `update` 遍历服务器执行资源准备，完整部署仍应使用 `server.sh update`。
 Admin API 为 GET/POST /admin/v1/resources/update，Bridge 为
-GET/POST /bridge/v1/resources/update；GET /bridge/v1/revision 返回激活代次。
-resources.rs 校验完整资源、世界压缩包和服务器定义后原子发布 current.json。
-失败保留当前代次，启动中的实例固定代次，运行中的实例继续使用其链接文件。
-重复更新复用已验证的远程下载缓存，本地文件直接链接。更新不读写 saves/。
+GET/POST /bridge/v1/resources/update；GET /bridge/v1/revision 返回目录变更标识，供
+GameVoting 检测并重载目录。GET /health 还返回实际运行二进制的 SHA-256 和部署布局标识，
+用于识别磁盘已经替换而旧进程仍然运行的情况。
+
+`deployment.rs` 发布 `cache/servers/<server-id>/` 中唯一的当前资源与配置集，
+`cache/catalog/servers/` 保存已发布服务定义。发布与实例链接使用跨进程共享/独占锁，
+单台服务器失败不改变该服务器上一份可用资源。没有变化时不建立新历史目录。
+服务启动失败会尝试恢复上一份资源与配置；回退集只在本次验证期间保留，成功后清理。
+Paper 更新阶段提前准备 Minecraft/运行依赖；旧运行缓存不会覆盖已声明的新核心依赖。
+资源准备及清理不触碰 saves/ 或 database/data；服务重启沿用正常的持久世界保存流程。
 
 模板来自 depend/worlds/*.tar.gz，每次新实例解压到 runtime；玩家首次创建解谜会话时
 直接解压到 saves/players/<owner-uuid>/<game-id>/。双人共享一份拥有者存档。
 共享持久世界位于 saves/shared/<world-id>/。这些存档、数据库、运行缓存都应忽略提交。
-本地文件更新采用新的版本文件名并修改 source.path，以保留旧实例使用的文件。
+本地文件保持可读名称；Git/LFS 替换来源文件后，发布任务更新链接，原实例继续持有旧 inode。无需为每次更新新增文件名。
 
 日志按宿主机日期轮转，每分钟检查；64 MiB 提前轮转，gzip 压缩后清空当前文件，
 归档保留 14 天。启动过程的 stdout/stderr 另存 logs/scheduler-bootstrap.log。

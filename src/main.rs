@@ -4,6 +4,7 @@ mod client;
 mod config;
 mod daily_log;
 mod dependency_cache;
+mod deployment;
 mod layout;
 mod manager;
 mod network;
@@ -65,6 +66,18 @@ enum SchedulerCommand {
   List,
   /// Prepare and atomically activate the resource manifests.
   Update,
+  /// Prepare just one server and publish its current resource set.
+  Prepare {
+    server_id: String,
+    #[arg(long)]
+    local_only: bool,
+  },
+  /// Remove resource cache objects not referenced by a published server.
+  CacheGc,
+  /// Restore the previous per-server set after failed readiness.
+  RollbackResources {
+    server_id: String,
+  },
   /// Compare local external definitions with the running daemon's game catalog (read-only).
   Catalog {
     game_id: Option<String>,
@@ -117,13 +130,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
       }
     }
-    SchedulerCommand::Update => {
-      let updater = resources::Updater::new(config.clone());
-      let revision = updater
-        .run()
+    SchedulerCommand::Prepare {
+      server_id,
+      local_only,
+    } => {
+      let result = deployment::prepare(config, &server_id, local_only)
         .await
         .map_err(|e| io::Error::other(e.to_string()))?;
-      println!("Resource generation {revision} activated");
+      println!("{}", serde_json::to_string(&result)?);
+    }
+    SchedulerCommand::RollbackResources { server_id } => {
+      deployment::rollback(&config, &server_id).map_err(|e| io::Error::other(e.to_string()))?;
+    }
+    SchedulerCommand::CacheGc => {
+      println!(
+        "Removed {} unused objects",
+        deployment::gc(&config).map_err(|e| io::Error::other(e.to_string()))?
+      );
+    }
+    SchedulerCommand::Update => {
+      let mut source = (*config).clone();
+      source.generation = Some(config.resolve(&config.value.paths.manifests));
+      let mut failures = Vec::new();
+      for id in source.server_ids().await? {
+        match deployment::prepare(config.clone(), &id, false).await {
+          Ok(result) => println!("{}", serde_json::to_string(&result)?),
+          Err(error) => failures.push(format!("{id}: {error}")),
+        }
+      }
+      if !failures.is_empty() {
+        return Err(io::Error::other(failures.join("\n")).into());
+      }
+      deployment::gc(&config).map_err(|e| io::Error::other(e.to_string()))?;
     }
     SchedulerCommand::Catalog { game_id } => {
       catalog_check::run(&config, game_id.as_deref()).await?;
